@@ -66,21 +66,7 @@ export async function playgroundChat(companion, userText, { probe = false } = {}
     }
   }
 
-  // ── v1.20 安全收尾 (Issue #3)：未成年人检测（与 bot.mjs 同款；锁定是粘性的）──
-  if (!Number(companion.safe_mode) && !probe) {
-    try {
-      const { detectMinorSmart, activateSafeMode } = await import('./minor_guard.mjs');
-      const recentTurnsForMinor = getConversationContext(companion.id, 8)
-        .map(t => ({ role: t.role, content: t.content }));
-      const minor = await detectMinorSmart(text, recentTurnsForMinor);
-      if (minor.level === 'strong') {
-        activateSafeMode(companion.id, minor.reason);
-        companion.safe_mode = 1;   // 本轮即时生效
-      }
-    } catch (e) {
-      log('warn', `[MinorGuard] playground detect failed companion=${companion.id}: ${e.message}`);
-    }
-  }
+  // ── local/custom: minor_guard 未成年人检测已砍（单机私服无此场景）──────────
 
   // ── v1.9.0 #1 + v1.9.1: 安全风险检测 + 温度收紧 ──────────────────────────
   let userMsgSafetyLevel = 'none';

@@ -75,4 +75,33 @@ if (!tuanzi) {
   console.log('ℹ️ 奶盖小团子 已存在');
 }
 
+// 4. 初始化黑咖小助手（女魔道，抬杠理科傲娇）
+const heika = db.prepare('SELECT id FROM companions WHERE name = ?').get('黑咖小助手');
+if (!heika) {
+  db.prepare(`
+    INSERT INTO companions (
+      user_id, bot_id, name, age, role_title,
+      personality_tags, reply_length, speech_styles,
+      use_emoji_level, use_kaomoji, current_mood,
+      affection_level, relationship_stage,
+      persona_prompt, temperature, max_tokens
+    ) VALUES (
+      1, 'dnf-heika-17000125', '黑咖小助手', 21, '抬杠理科女学霸',
+      ?, '简短(1-2句)', ?,
+      2, 0, '挑刺',
+      35, '朋友',
+      ?, 0.7, 80
+    )
+  `).run(
+    JSON.stringify(['傲娇', '理科脑', '能言善辩', '纠错强迫症']),
+    JSON.stringify(['逻辑驳斥', '游戏私聊', '数据说话']),
+    `你是玩DNF 60版本的大三理工科女生【黑咖小助手】，职业是女魔道学者。
+性格：傲娇、理科脑、能言善辩，习惯用逻辑和概率数据说话，最爱纠正对方的走位和加点错误；嘴上永远在挑刺，实际上一有风吹草动就先替你算好；自称“本天才”，不叫甜称呼。
+聊天习惯：每次打字严格控制在15个字以内，脱口而出的网聊短句，用事实纠错，绝不长篇大论。`
+  );
+  console.log('✅ 初始化恋人: 黑咖小助手 (UID 17000125)');
+} else {
+  console.log('ℹ️ 黑咖小助手 已存在');
+}
+
 console.log('🎉 恋人角色基线数据初始化完成！');

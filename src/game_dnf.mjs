@@ -106,8 +106,24 @@ const CORPUS_DIR = path.resolve('data/dnf_corpus');
 const corpusCache = {
   peach: { mtime: 0, data: null },
   tuanzi: { mtime: 0, data: null },
+  heika: { mtime: 0, data: null },
   mail: { mtime: 0, data: null }
 };
+
+// 洗牌袋（Shuffle Bag）：保证一个周期内零连续重复，吃透完整 40 条语料
+const shuffleBags = {
+  peach: [],
+  tuanzi: [],
+  heika: []
+};
+
+function getNextShuffleItem(roleKey, items) {
+  if (!items || !items.length) return null;
+  if (!shuffleBags[roleKey] || shuffleBags[roleKey].length === 0) {
+    shuffleBags[roleKey] = [...items].sort(() => Math.random() - 0.5);
+  }
+  return shuffleBags[roleKey].pop();
+}
 
 function loadCorpusHot(name) {
   const filePath = path.join(CORPUS_DIR, `${name}_corpus.json`);
@@ -144,14 +160,23 @@ function loadMailTemplatesHot() {
 }
 
 function getLocalGamerGirlReply(companion, text, eventType = null) {
-  const isTuanzi = companion.name.includes('团子');
-  const roleKey = isTuanzi ? 'tuanzi' : 'peach';
+  let roleKey = 'peach';
+  if (companion.name.includes('团子')) roleKey = 'tuanzi';
+  else if (companion.name.includes('黑咖') || companion.name.includes('助手')) roleKey = 'heika';
+
   const hotData = loadCorpusHot(roleKey);
   const t = String(text || '').toLowerCase();
   const hour = new Date().getHours();
 
   // 1. 优先从外置结构化热更语料库中精准命中
   if (hotData) {
+    // 0. 主动打招呼 / 问候事件：严格使用洗牌袋抽取 40 条去 AI 感语料（周期内零重复）
+    if (eventType === 'greeting' || !t) {
+      const proactive = hotData.proactive_greetings;
+      if (proactive?.length) {
+        return getNextShuffleItem(roleKey, proactive);
+      }
+    }
     // A. 防 AI 试探反击（绝不出戏自爆）
     if (/机器人|大模型|ai|人工智能|脚本|外挂|假人|chatgpt/.test(t)) {
       const antiLines = hotData.social?.anti_bot;
@@ -339,11 +364,26 @@ gameRouter.post('/game/chat', async (req, res) => {
   const text = String(req.body?.text ?? '').trim();
   const eventType = req.body?.event_type || null;
 
-  if (!text) return res.status(400).json({ ok: false, error: 'text 不能为空' });
+  if (!text && !eventType) return res.status(400).json({ ok: false, error: 'text 或 event_type 不能为空' });
   if (text.length > 2000) return res.status(400).json({ ok: false, error: 'text 过长（>2000）' });
 
   const c = findCompanion(npc);
   if (!c) return res.status(404).json({ ok: false, error: `恋人 NPC 不存在: ${npc}` });
+
+  // 如果纯属主动问候事件（!text && eventType === 'greeting'），直接由洗牌袋出高质量非 AI 感语料
+  if (!text && eventType === 'greeting') {
+    const reply = getLocalGamerGirlReply(c, '', 'greeting');
+    return res.json({
+      ok: true,
+      npc: c.name,
+      reply,
+      sleeping: false,
+      mood: c.current_mood,
+      affection: c.affection_level,
+      relationship_stage: c.relationship_stage,
+      source: 'proactive_shuffle'
+    });
+  }
 
   // 1. 尝试在线 LLM（带 1.5 秒硬超时）
   let onlineResult = null;

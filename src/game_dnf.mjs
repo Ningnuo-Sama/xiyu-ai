@@ -15,6 +15,8 @@
 
 import { log } from './logger.mjs';
 import { Router } from 'express';
+import fs from 'fs';
+import path from 'path';
 import { getDb, parseCompanionRow } from './db.mjs';
 import { playgroundChat } from './playground.mjs';
 import { buildSystemPrompt } from './companion.mjs';
@@ -99,11 +101,146 @@ const GAMER_GIRL_CHAT_FALLBACK = {
   }
 };
 
+// ── 2.1 外置语料动态热更加载器（基于 mtime 自动热重载，无需重启服务） ─────────
+const CORPUS_DIR = path.resolve('data/dnf_corpus');
+const corpusCache = {
+  peach: { mtime: 0, data: null },
+  tuanzi: { mtime: 0, data: null },
+  mail: { mtime: 0, data: null }
+};
+
+function loadCorpusHot(name) {
+  const filePath = path.join(CORPUS_DIR, `${name}_corpus.json`);
+  try {
+    if (!fs.existsSync(filePath)) return null;
+    const stat = fs.statSync(filePath);
+    if (corpusCache[name]?.data && corpusCache[name].mtime === stat.mtimeMs) {
+      return corpusCache[name].data;
+    }
+    const raw = fs.readFileSync(filePath, 'utf-8');
+    const parsed = JSON.parse(raw);
+    corpusCache[name] = { mtime: stat.mtimeMs, data: parsed };
+    return parsed;
+  } catch (err) {
+    return corpusCache[name]?.data || null;
+  }
+}
+
+function loadMailTemplatesHot() {
+  const filePath = path.join(CORPUS_DIR, 'mail_templates.json');
+  try {
+    if (!fs.existsSync(filePath)) return null;
+    const stat = fs.statSync(filePath);
+    if (corpusCache.mail?.data && corpusCache.mail.mtime === stat.mtimeMs) {
+      return corpusCache.mail.data;
+    }
+    const raw = fs.readFileSync(filePath, 'utf-8');
+    const parsed = JSON.parse(raw);
+    corpusCache.mail = { mtime: stat.mtimeMs, data: parsed };
+    return parsed;
+  } catch (err) {
+    return corpusCache.mail?.data || null;
+  }
+}
+
 function getLocalGamerGirlReply(companion, text, eventType = null) {
   const isTuanzi = companion.name.includes('团子');
-  const pool = isTuanzi ? GAMER_GIRL_CHAT_FALLBACK.tuanzi : GAMER_GIRL_CHAT_FALLBACK.peach;
+  const roleKey = isTuanzi ? 'tuanzi' : 'peach';
+  const hotData = loadCorpusHot(roleKey);
   const t = String(text || '').toLowerCase();
+  const hour = new Date().getHours();
 
+  // 1. 优先从外置结构化热更语料库中精准命中
+  if (hotData) {
+    // A. 防 AI 试探反击（绝不出戏自爆）
+    if (/机器人|大模型|ai|人工智能|脚本|外挂|假人|chatgpt/.test(t)) {
+      const antiLines = hotData.social?.anti_bot;
+      if (antiLines?.length) return antiLines[Math.floor(Math.random() * antiLines.length)];
+    }
+
+    // B. 时间与作息摸鱼借口（专治“为什么上课还在线/秒回”）
+    if (/上课|为什么在线|怎么在线|还在玩|没睡|怎么还没睡|在干嘛|在干啥|查寝/.test(t)) {
+      let routineLines = null;
+      if (hour >= 8 && hour < 12) routineLines = hotData.routine?.in_class;
+      else if (hour >= 12 && hour < 14) routineLines = hotData.routine?.lunch;
+      else if (hour >= 14 && hour < 17) routineLines = hotData.routine?.afternoon;
+      else if (hour >= 22 && hour < 24) routineLines = hotData.routine?.curfew;
+      else if (hour >= 0 && hour < 7) routineLines = hotData.routine?.late_night;
+      else routineLines = hotData.routine?.in_class;
+
+      if (routineLines?.length) return routineLines[Math.floor(Math.random() * routineLines.length)];
+    }
+
+    // C. 深渊派对事件 (祈愿/闪光/光头/APC)
+    if (eventType === 'abyss' || /深渊|史诗|闪光|光头|柱子|无影剑|爆粉/.test(t)) {
+      let pool = hotData.abyss?.pray;
+      if (/闪|金|出货|出ss|出史诗/.test(t)) pool = hotData.abyss?.spark_epic;
+      else if (/光头|蓝天白云|没出|空手/.test(t)) pool = hotData.abyss?.bald_head;
+      else if (/apc|骷髅|长枪/.test(t)) pool = hotData.abyss?.kill_apc;
+      if (pool?.length) return pool[Math.floor(Math.random() * pool.length)];
+    }
+
+    // D. 强化与增幅打造
+    if (eventType === 'equip_broken' || /碎|强化|凯丽|失败|炸了/.test(t)) {
+      const pool = hotData.upgrade?.broken;
+      if (pool?.length) return pool[Math.floor(Math.random() * pool.length)];
+    } else if (/成功|上10|上11|上12|上13|红光/.test(t)) {
+      const pool = hotData.upgrade?.success;
+      if (pool?.length) return pool[Math.floor(Math.random() * pool.length)];
+    } else if (/增幅|克伦特|红字/.test(t)) {
+      const pool = hotData.upgrade?.clonte_amplify;
+      if (pool?.length) return pool[Math.floor(Math.random() * pool.length)];
+    }
+
+    // E. 副本战斗、缺蓝与躺尸求救
+    if (/没蓝|空蓝|缺蓝|泉水|药/.test(t)) {
+      const pool = hotData.dungeon?.out_of_mana;
+      if (pool?.length) return pool[Math.floor(Math.random() * pool.length)];
+    } else if (/死了|躺尸|挂了|黑白电视/.test(t)) {
+      const pool = hotData.dungeon?.player_dead;
+      if (pool?.length) return pool[Math.floor(Math.random() * pool.length)];
+    } else if (/救我|拉我|复活币/.test(t)) {
+      const pool = hotData.dungeon?.companion_dead;
+      if (pool?.length) return pool[Math.floor(Math.random() * pool.length)];
+    } else if (eventType === 'carry' || /带我|组队|刷图|进图|悬空|牛|悲鸣|副本/.test(t)) {
+      const pool = hotData.dungeon?.entry;
+      if (pool?.length) return pool[Math.floor(Math.random() * pool.length)];
+    }
+
+    // F. 材料互助
+    if (/黑曜石/.test(t)) {
+      const pool = hotData.materials?.need_obsidian;
+      if (pool?.length) return pool[Math.floor(Math.random() * pool.length)];
+    } else if (/灵魂/.test(t)) {
+      const pool = hotData.materials?.need_soul;
+      if (pool?.length) return pool[Math.floor(Math.random() * pool.length)];
+    } else if (/灾难/.test(t)) {
+      const pool = hotData.materials?.need_calamity;
+      if (pool?.length) return pool[Math.floor(Math.random() * pool.length)];
+    } else if (/无色|大招/.test(t)) {
+      const pool = hotData.materials?.cube_reimburse;
+      if (pool?.length) return pool[Math.floor(Math.random() * pool.length)];
+    }
+
+    // G. 社交与情感
+    if (/吃醋|女枪|妹子|别的女|别人|野女人/.test(t)) {
+      const pool = hotData.social?.jealous;
+      if (pool?.length) return pool[Math.floor(Math.random() * pool.length)];
+    } else if (/在吗|在么|上线|人呢|嗨|哈喽/.test(t)) {
+      const pool = hotData.social?.greeting;
+      if (pool?.length) return pool[Math.floor(Math.random() * pool.length)];
+    } else if (/站街|发呆|看海/.test(t)) {
+      const pool = hotData.social?.standby;
+      if (pool?.length) return pool[Math.floor(Math.random() * pool.length)];
+    }
+
+    // 默认兜底：从日常闲聊池或问候池抽取
+    const allSocial = [...(hotData.social?.greeting || []), ...(hotData.social?.standby || []), ...(hotData.social?.sweet_talk || [])];
+    if (allSocial.length) return allSocial[Math.floor(Math.random() * allSocial.length)];
+  }
+
+  // 2. 安全回退：如果外置文件未加载，使用硬编码常量（绝对不崩溃）
+  const fallbackPool = isTuanzi ? GAMER_GIRL_CHAT_FALLBACK.tuanzi : GAMER_GIRL_CHAT_FALLBACK.peach;
   let category = 'default';
   if (eventType === 'equip_broken' || /碎|强化|凯丽|失败/.test(t)) {
     category = 'equip_broken';
@@ -114,8 +251,7 @@ function getLocalGamerGirlReply(companion, text, eventType = null) {
   } else if (/吃醋|女枪|妹子|别的女|别人/.test(t)) {
     category = 'jealous';
   }
-
-  const lines = pool[category] || pool.default;
+  const lines = fallbackPool[category] || fallbackPool.default;
   return lines[Math.floor(Math.random() * lines.length)];
 }
 
@@ -217,7 +353,11 @@ gameRouter.post('/game/chat', async (req, res) => {
     const timeoutPromise = new Promise((_, reject) =>
       setTimeout(() => reject(new Error('API_TIMEOUT')), CHAT_TIMEOUT_MS)
     );
-    onlineResult = await Promise.race([playgroundChat(c, text), timeoutPromise]);
+    const safeOnlineChat = playgroundChat(c, text).catch(err => {
+      log('warn', `[Game] 在线生成异常 npc=${c.name}: ${err.message}`);
+      return null;
+    });
+    onlineResult = await Promise.race([safeOnlineChat, timeoutPromise]);
   } catch (err) {
     log('warn', `[Game] 在线生成降级 npc=${c.name} 原因: ${err.message}`);
     onlineResult = null;
@@ -287,8 +427,13 @@ gameRouter.post('/game/mail', async (req, res) => {
       setTimeout(() => reject(new Error('API_TIMEOUT')), 3000)
     );
 
+    const safeGenerate = generateReply(personaPrompt, [], instruction, { max_tokens: 400 }, { companionId: c.id }).catch(err => {
+      log('warn', `[Game] 邮件在线生成异常 npc=${c.name}: ${err.message}`);
+      return null;
+    });
+
     const mail = await Promise.race([
-      generateReply(personaPrompt, [], instruction, { max_tokens: 400 }, { companionId: c.id }),
+      safeGenerate,
       timeoutPromise
     ]);
 

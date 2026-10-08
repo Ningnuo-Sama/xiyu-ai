@@ -46,5 +46,14 @@ app.use((error, _req, res, _next) => {
 });
 
 getDb();
+
+// 进程保活护栏：捕获未处理的 Promise 拒绝与异常，严防突发网络波动导致守护进程退出
+process.on('unhandledRejection', (reason) => {
+  log('warn', `[Main] 捕获到未处理的 Promise 拒绝（已静默拦截，服务保持常驻）: ${reason?.message || reason}`);
+});
+process.on('uncaughtException', (err) => {
+  log('error', `[Main] 捕获到未处理异常: ${err?.message || err}`);
+});
+
 log('info', '[Main] DNF 大脑模式启动（出口：/game/chat 1:1私聊 + /game/mail 游戏邮件）');
 app.listen(PORT, '127.0.0.1', () => log('info', `[Main] DNF 大脑已启动 port=${PORT}（仅监听本机）`));

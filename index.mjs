@@ -1,58 +1,50 @@
 /**
- * 主入口（local/custom 精简版：砍掉微信 iLink 轮询池）
+ * 主入口（local/custom：DNF 恋人系统专用大脑，极限精简版）
  *
- * DNF 恋人系统改造：只保留 REST API + 主动消息调度 + 计划任务。
- * 微信/iLink 渠道整体移除；registerBotAccount 等保留 no-op 桩以兼容 api.mjs 的
- * setBotPoolHandle 注入。游戏渠道走 /api/companions/:id/playground-chat。
+ * 出口只有两个，全部走 DNF 游戏服务端：
+ *   POST /game/chat  — 1:1 私聊（玩家 ↔ 恋人 NPC）
+ *   POST /game/mail  — 游戏邮件（恋人主动来信/回信文本生成）
+ *
+ * 砍掉：微信 iLink、REST 多租户服务(api.mjs)、Web UI、账号/认证/计费、
+ * 照片/语音/ASR/TTS、proactive 调度、cron 计划任务、admin。
+ * 保留核心：SQLite 记忆/情绪/关系弧/好感度 + playground 回复管线。
+ *
+ * 鉴权：固定令牌 env GAME_TOKEN（header x-game-token），仅限本机游戏服务端调用。
  *
  * Copyright (c) 2026 溪语 AI Contributors. MIT License.
  */
 
 import 'dotenv/config';
-import { getDb } from './src/db.mjs';
-import { startApiServer, setBotPoolHandle } from './src/api.mjs';
-import { startProactiveScheduler } from './src/proactive.mjs';
-import { startPlanTasks } from './src/plan_tasks.mjs';
-import { loadAdminCredentials } from './src/admin.mjs';
+import express from 'express';
 import { log } from './src/logger.mjs';
+import { getDb } from './src/db.mjs';
+import { gameRouter } from './src/game_dnf.mjs';
 
-// ── 微信池 no-op 桩（local/custom: iLink 渠道已砍） ──────────────────────────
-export function registerBotAccount() { return false; }
-export function unregisterBotAccount() { return false; }
-export function listBotPool() { return []; }
+const PORT = Number(process.env.API_PORT) || 3366;
+const TOKEN = String(process.env.GAME_TOKEN || '').trim();
 
-async function runLoop() {}
+const app = express();
+app.use(express.json({ limit: '64kb' }));
 
-async function bootstrap() {
-  getDb();
-  log('info', '[Main] 数据库初始化完成');
-
-  // 初始化管理员凭据（首次启动会生成并打印一次密码）
-  loadAdminCredentials();
-
-  // 启动 REST API
-  startApiServer();
-  setBotPoolHandle({ registerBotAccount, unregisterBotAccount, listBotPool });
-
-  // 主动消息 + 计划任务（无微信绑定时自动跳过发送，仅积累素材）
-  startProactiveScheduler();
-  startPlanTasks();
-
-  log('info', '[Main] local/custom 精简启动完成（微信渠道已砍，游戏渠道走 REST API）');
-}
-
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-process.on('SIGTERM', () => {
-  log('info', '[Main] SIGTERM 收到，退出中...');
-  setTimeout(() => process.exit(0), 1000);
-});
-process.on('SIGINT', () => {
-  log('info', '[Main] SIGINT 收到，退出中...');
-  setTimeout(() => process.exit(0), 1000);
+// 固定令牌鉴权（health 豁免）
+app.use((req, res, next) => {
+  if (req.path === '/health') return next();
+  if (!TOKEN) return res.status(503).json({ ok: false, error: 'GAME_TOKEN 未配置' });
+  if (String(req.header('x-game-token') || '') !== TOKEN) {
+    return res.status(401).json({ ok: false, error: 'token 无效' });
+  }
+  next();
 });
 
-bootstrap().catch(err => {
-  log('error', `[Main] 启动失败: ${err.message}\n${err.stack}`);
-  process.exit(1);
+app.get('/health', (_req, res) => res.json({ ok: true, mode: 'dnf-brain' }));
+app.use('/', gameRouter);
+
+app.use((_req, res) => res.status(404).json({ ok: false, error: 'not found' }));
+app.use((error, _req, res, _next) => {
+  log('error', `[Game] 未捕获异常: ${error.message}`);
+  res.status(500).json({ ok: false, error: error.message || 'internal error' });
 });
+
+getDb();
+log('info', '[Main] DNF 大脑模式启动（出口：/game/chat 1:1私聊 + /game/mail 游戏邮件）');
+app.listen(PORT, '127.0.0.1', () => log('info', `[Main] DNF 大脑已启动 port=${PORT}（仅监听本机）`));

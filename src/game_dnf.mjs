@@ -280,10 +280,10 @@ function getLocalGamerGirlReply(companion, text, eventType = null) {
   return lines[Math.floor(Math.random() * lines.length)];
 }
 
-// ── 3. 塞拉邮局合规礼物清单（100% 60版本真实可交易道具） ─────────────────────
+// ── 3. 塞拉邮局合规礼物清单（100% 60版本 Script.pvf 白盒核验真实道具ID） ───────────
 export const DNF_LEGIT_MAIL_GIFTS = [
   {
-    item_id: 11,
+    item_id: 27600, // PVF: equipment/character/swordman/weapon/katana/kat_damaged.equ
     name: '+11 生锈的武士刀',
     count: 1,
     upgrade_level: 11,
@@ -296,7 +296,7 @@ export const DNF_LEGIT_MAIL_GIFTS = [
     }
   },
   {
-    item_id: 11,
+    item_id: 27600, // PVF: equipment/character/swordman/weapon/katana/kat_damaged.equ
     name: '+12 生锈的武士刀',
     count: 1,
     upgrade_level: 12,
@@ -309,7 +309,7 @@ export const DNF_LEGIT_MAIL_GIFTS = [
     }
   },
   {
-    item_id: 3015,
+    item_id: 3171, // PVF: stackable/material/ryan_cokes.stk
     name: '炉岩碳',
     count: 50,
     category: 'catalyst',
@@ -321,7 +321,7 @@ export const DNF_LEGIT_MAIL_GIFTS = [
     }
   },
   {
-    item_id: 3037,
+    item_id: 3174, // PVF: stackable/material/stone_clear.stk
     name: '无色小晶块',
     count: 200,
     category: 'cube',
@@ -333,7 +333,7 @@ export const DNF_LEGIT_MAIL_GIFTS = [
     }
   },
   {
-    item_id: 1002,
+    item_id: 1048, // PVF: stackable/ptn_scwater.stk (天空之城泉水)
     name: '天空之城泉水',
     count: 30,
     category: 'recovery',
@@ -345,7 +345,7 @@ export const DNF_LEGIT_MAIL_GIFTS = [
     }
   },
   {
-    item_id: 1055,
+    item_id: 1070, // PVF: stackable/bible_blue.stk (蓝色圣经)
     name: '蓝色圣经',
     count: 5,
     category: 'special',
@@ -355,8 +355,91 @@ export const DNF_LEGIT_MAIL_GIFTS = [
       peach: '听说你要去打无头骑士？做任务特意给你留了5本蓝色圣经，+20%回避率呢，保命别老被秒！',
       tuanzi: '听说某个笨蛋老被boss秒？这5本蓝色圣经吃了加回避，别再笨手笨脚被撞飞了！'
     }
+  },
+  {
+    item_id: 3214, // PVF: stackable/material/invitation_bluedevil.stk (蓝色恶魔邀请函)
+    name: '深渊派对邀请函 (深渊票)',
+    count: 20,
+    category: 'abyss_ticket',
+    reason: '深渊门票材料赞助',
+    dialogue: {
+      title: '深渊票赞助！',
+      peach: '哥哥！我包里存的20张深渊票寄给你啦，今天一定要带我爆出金色闪光史诗呀OvO！',
+      tuanzi: '诺，这20张深渊票拿去打！要是敢光头空手出来，看本姑娘怎么收拾你！'
+    }
   }
 ];
+
+// ── 2.2 方案B：拟人化打字机动量与短句切分器（Sentence Burst Chunker） ────────
+const EMOJI_MAP = [
+  [/[\u{1F600}-\u{1F606}\u{1F60A}\u{1F60D}\u{1F618}\u{1F970}]/gu, '^ ^'],
+  [/[\u{1F62D}\u{1F622}\u{1F97A}\u{1F625}]/gu, 'QAQ'],
+  [/[\u{1F620}\u{1F621}\u{1F624}\u{1F92C}]/gu, '哼！'],
+  [/[\u{2764}\u{FE0F}\u{1F496}\u{1F495}\u{1F49E}\u{1F49F}\u{1F49B}\u{1F49C}\u{1F49D}]/gu, '[心]'],
+  [/[\u{1F44D}]/gu, '[赞]'],
+  [/[\u{1F44E}]/gu, '[踩]'],
+  [/[\u{1F389}\u{1F388}\u{2728}\u{1F31F}]/gu, 'OvO'],
+  [/[\u{1F4A5}\u{1F525}]/gu, '!!']
+];
+
+export function sanitizeEmojiToGBK(text) {
+  let res = String(text || '');
+  for (const [regex, replacement] of EMOJI_MAP) {
+    res = res.replace(regex, replacement);
+  }
+  // 过滤掉所有未映射的多字节非GBK Unicode字符，防止触发服务端一票否决
+  res = res.replace(/[\u{1F300}-\u{1F9FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]/gu, '');
+  return res;
+}
+
+export function chunkToBursts(rawText) {
+  const sanitized = sanitizeEmojiToGBK(rawText).trim();
+  if (!sanitized) return { replies: ['在呢在呢~'], delays_ms: [1000], overflow_mail: null };
+
+  // 按换行、句号、感叹号、问号切分为候选句子
+  const parts = sanitized.split(/(?<=[。！？!\?\n~])/).map(s => s.trim()).filter(Boolean);
+  const sentences = [];
+
+  for (const part of parts) {
+    if (part.length <= 25) {
+      sentences.push(part);
+    } else {
+      // 超过25字按逗号进一步切分
+      const subParts = part.split(/(?<=[，,、])/).map(s => s.trim()).filter(Boolean);
+      for (const sp of subParts) {
+        if (sp.length <= 25) {
+          sentences.push(sp);
+        } else {
+          // 仍然过长则硬切22字
+          for (let i = 0; i < sp.length; i += 22) {
+            sentences.push(sp.slice(i, i + 22));
+          }
+        }
+      }
+    }
+  }
+
+  // 短句暴击限制：最多 3 句，超过 3 句的内容收拢成塞拉邮局长信
+  let replies = sentences.slice(0, 3);
+  if (!replies.length) replies = [sanitized.slice(0, 22)];
+
+  // 计算每句的拟真打字延迟毫秒数 (800ms ~ 3500ms)
+  const delays_ms = replies.map(line => {
+    const jitter = Math.floor(Math.random() * 250) - 100;
+    const delay = 800 + line.length * 130 + jitter;
+    return Math.max(800, Math.min(3500, delay));
+  });
+
+  let overflow_mail = null;
+  if (sentences.length > 3 || sanitized.length > 80) {
+    overflow_mail = {
+      title: '给你写了封长信~',
+      body: sanitized.slice(0, 350)
+    };
+  }
+
+  return { replies, delays_ms, overflow_mail };
+}
 
 // ── POST /game/chat：1:1 私聊（API 优先，1.5s 超时瞬间退本地） ───────────────
 gameRouter.post('/game/chat', async (req, res) => {
@@ -373,10 +456,14 @@ gameRouter.post('/game/chat', async (req, res) => {
   // 如果纯属主动问候事件（!text && eventType === 'greeting'），直接由洗牌袋出高质量非 AI 感语料
   if (!text && eventType === 'greeting') {
     const reply = getLocalGamerGirlReply(c, '', 'greeting');
+    const burst = chunkToBursts(reply);
     return res.json({
       ok: true,
       npc: c.name,
-      reply,
+      reply: burst.replies[0] || reply,
+      replies: burst.replies,
+      delays_ms: burst.delays_ms,
+      overflow_mail: burst.overflow_mail,
       sleeping: false,
       mood: c.current_mood,
       affection: c.affection_level,
@@ -403,12 +490,16 @@ gameRouter.post('/game/chat', async (req, res) => {
     onlineResult = null;
   }
 
-  // 2. 如果在线成功，返回在线内容
+  // 2. 如果在线成功，返回在线内容（经方案B断句切分）
   if (onlineResult && onlineResult.reply) {
+    const burst = chunkToBursts(onlineResult.reply);
     return res.json({
       ok: true,
       npc: c.name,
-      reply: onlineResult.reply,
+      reply: burst.replies[0] || onlineResult.reply,
+      replies: burst.replies,
+      delays_ms: burst.delays_ms,
+      overflow_mail: burst.overflow_mail,
       sleeping: !!onlineResult.sleeping,
       mood: onlineResult.state?.mood ?? c.current_mood,
       affection: onlineResult.state?.affection_level ?? c.affection_level,
@@ -419,10 +510,14 @@ gameRouter.post('/game/chat', async (req, res) => {
 
   // 3. 【无感退本地】：命中本地短句语料（0ms 响应，绝不卡死）
   const fallbackReply = getLocalGamerGirlReply(c, text, eventType);
+  const burst = chunkToBursts(fallbackReply);
   return res.json({
     ok: true,
     npc: c.name,
-    reply: fallbackReply,
+    reply: burst.replies[0] || fallbackReply,
+    replies: burst.replies,
+    delays_ms: burst.delays_ms,
+    overflow_mail: burst.overflow_mail,
     sleeping: false,
     mood: c.current_mood,
     affection: c.affection_level,

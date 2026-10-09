@@ -265,7 +265,7 @@ function getLocalGamerGirlReply(companion, text, eventType = null) {
   }
 
   // 2. 安全回退：如果外置文件未加载，使用硬编码常量（绝对不崩溃）
-  const fallbackPool = isTuanzi ? GAMER_GIRL_CHAT_FALLBACK.tuanzi : GAMER_GIRL_CHAT_FALLBACK.peach;
+  const fallbackPool = roleKey === 'tuanzi' ? GAMER_GIRL_CHAT_FALLBACK.tuanzi : GAMER_GIRL_CHAT_FALLBACK.peach;
   let category = 'default';
   if (eventType === 'equip_broken' || /碎|强化|凯丽|失败/.test(t)) {
     category = 'equip_broken';
@@ -280,7 +280,13 @@ function getLocalGamerGirlReply(companion, text, eventType = null) {
   return lines[Math.floor(Math.random() * lines.length)];
 }
 
-// ── 3. 塞拉邮局合规礼物清单（100% 60版本 Script.pvf 白盒核验真实道具ID） ───────────
+// ── 3. 塞拉邮局合规礼物清单与情境状态机（100% 60版本 Script.pvf 白盒核验真实道具ID） ───────────
+export const MAIL_SCENARIOS = {
+  EQUIP_BROKEN: 'equip_broken',
+  OFFLINE_CARE: 'offline_care',
+  ABYSS_BLANK: 'abyss_blank'
+};
+
 export const DNF_LEGIT_MAIL_GIFTS = [
   {
     item_id: 27600, // PVF: equipment/character/swordman/weapon/katana/kat_damaged.equ
@@ -288,6 +294,7 @@ export const DNF_LEGIT_MAIL_GIFTS = [
     count: 1,
     upgrade_level: 11,
     category: 'pad_weapon',
+    scenario: 'equip_broken',
     reason: '给他寄把垫刀用的高强白装武器',
     dialogue: {
       title: '给你垫刀的神器！',
@@ -301,6 +308,7 @@ export const DNF_LEGIT_MAIL_GIFTS = [
     count: 1,
     upgrade_level: 12,
     category: 'pad_weapon',
+    scenario: 'equip_broken',
     reason: '极品高阶垫刀神器',
     dialogue: {
       title: '终极垫刀神器！',
@@ -312,7 +320,9 @@ export const DNF_LEGIT_MAIL_GIFTS = [
     item_id: 3171, // PVF: stackable/material/ryan_cokes.stk
     name: '炉岩碳',
     count: 50,
+    upgrade_level: 0,
     category: 'catalyst',
+    scenario: 'equip_broken',
     reason: '给他寄点强化用的炉岩碳',
     dialogue: {
       title: '给你赞助点碳！',
@@ -324,7 +334,9 @@ export const DNF_LEGIT_MAIL_GIFTS = [
     item_id: 3174, // PVF: stackable/material/stone_clear.stk
     name: '无色小晶块',
     count: 200,
+    upgrade_level: 0,
     category: 'cube',
+    scenario: 'offline_care',
     reason: '组队45大招报销',
     dialogue: {
       title: '大招随便放！',
@@ -336,7 +348,9 @@ export const DNF_LEGIT_MAIL_GIFTS = [
     item_id: 1048, // PVF: stackable/ptn_scwater.stk (天空之城泉水)
     name: '天空之城泉水',
     count: 30,
+    upgrade_level: 0,
     category: 'recovery',
+    scenario: 'offline_care',
     reason: '回血回蓝补给品',
     dialogue: {
       title: '宿舍要熄灯啦~',
@@ -348,7 +362,9 @@ export const DNF_LEGIT_MAIL_GIFTS = [
     item_id: 1070, // PVF: stackable/bible_blue.stk (蓝色圣经)
     name: '蓝色圣经',
     count: 5,
+    upgrade_level: 0,
     category: 'special',
+    scenario: 'offline_care',
     reason: '打领主加回避保命神器',
     dialogue: {
       title: '保命圣经快拿着！',
@@ -360,7 +376,9 @@ export const DNF_LEGIT_MAIL_GIFTS = [
     item_id: 3214, // PVF: stackable/material/invitation_bluedevil.stk (蓝色恶魔邀请函)
     name: '深渊派对邀请函 (深渊票)',
     count: 20,
+    upgrade_level: 0,
     category: 'abyss_ticket',
+    scenario: 'abyss_blank',
     reason: '深渊门票材料赞助',
     dialogue: {
       title: '深渊票赞助！',
@@ -369,6 +387,149 @@ export const DNF_LEGIT_MAIL_GIFTS = [
     }
   }
 ];
+
+export function getMailGiftList() {
+  const hot = loadMailTemplatesHot();
+  if (Array.isArray(hot) && hot.length > 0) {
+    return hot.map(item => ({
+      item_id: item.item_id,
+      name: item.name,
+      count: item.count,
+      upgrade_level: item.upgrade_level || 0,
+      category: item.category,
+      scenario: item.scenario || (item.category === 'pad_weapon' || item.category === 'catalyst' ? 'equip_broken' : item.category === 'abyss_ticket' ? 'abyss_blank' : 'offline_care'),
+      reason: item.reason || item.description || '',
+      dialogue: item.dialogue
+    }));
+  }
+  return DNF_LEGIT_MAIL_GIFTS;
+}
+
+/**
+ * 解析触发情境（情境状态机），废除盲抽，杜绝无情境乱发高强装备
+ */
+export function resolveMailScenario({ scenario, eventType, hint, targetItemId } = {}) {
+  const explicit = String(scenario || eventType || '').trim().toLowerCase();
+  if (explicit) {
+    if (['equip_broken', 'broken', 'upgrade_broken', 'reinforce_fail', 'upgrade_fail', 'pad_weapon', 'catalyst'].includes(explicit)) {
+      return MAIL_SCENARIOS.EQUIP_BROKEN;
+    }
+    if (['offline_care', 'offline', 'goodnight', 'care', 'daily', 'greeting', 'dungeon_assist', 'cube_reimburse'].includes(explicit)) {
+      return MAIL_SCENARIOS.OFFLINE_CARE;
+    }
+    if (['abyss_blank', 'abyss', 'bald_head', 'epic_fail', 'invitation'].includes(explicit)) {
+      return MAIL_SCENARIOS.ABYSS_BLANK;
+    }
+    return explicit;
+  }
+
+  const h = String(hint || '').toLowerCase();
+  if (/碎|强化|垫刀|垫子|凯丽|炸了|失败|炉岩|碳|武士刀/.test(h)) {
+    return MAIL_SCENARIOS.EQUIP_BROKEN;
+  }
+  if (/深渊|光头|邀请函|门票|史诗|闪光|空手|恶魔邀请函/.test(h)) {
+    return MAIL_SCENARIOS.ABYSS_BLANK;
+  }
+  if (/晚安|下线|熄灯|睡觉|日常|泉水|回血|补给|圣经|回避|无色|大招|关电脑|拉闸/.test(h)) {
+    return MAIL_SCENARIOS.OFFLINE_CARE;
+  }
+
+  // 检查显式请求的 targetItemId 语义
+  if (targetItemId === 27600 || targetItemId === 3171 || targetItemId === 11 || targetItemId === 12) {
+    return MAIL_SCENARIOS.EQUIP_BROKEN;
+  }
+  if (targetItemId === 3214) {
+    return MAIL_SCENARIOS.ABYSS_BLANK;
+  }
+  if (targetItemId === 1048 || targetItemId === 1070 || targetItemId === 3174) {
+    return MAIL_SCENARIOS.OFFLINE_CARE;
+  }
+
+  // 兜底安全策略：无明确情境时归入日常离线关怀，杜绝乱发高强装备
+  return MAIL_SCENARIOS.OFFLINE_CARE;
+}
+
+/**
+ * 依据情境状态机选取专属礼物，废除 Math.random 盲抽
+ */
+export function selectMailGift({ scenario, hint = '', targetItemId = 0, targetUpgradeLevel = null } = {}) {
+  const allGifts = getMailGiftList();
+  const h = String(hint || '').toLowerCase();
+
+  // 兼容逻辑：如果 attach_item_id 传了 11/12，转换为武士刀 27600 对应强化等级
+  let normalizedItemId = Number(targetItemId || 0);
+  let normalizedUpgradeLevel = targetUpgradeLevel !== null && targetUpgradeLevel !== undefined ? Number(targetUpgradeLevel) : null;
+  if (normalizedItemId === 11) {
+    normalizedItemId = 27600;
+    if (normalizedUpgradeLevel === null) normalizedUpgradeLevel = 11;
+  } else if (normalizedItemId === 12) {
+    normalizedItemId = 27600;
+    if (normalizedUpgradeLevel === null) normalizedUpgradeLevel = 12;
+  }
+
+  // 1. 若显式指定 targetItemId，精确命中
+  if (normalizedItemId > 0) {
+    const matched = allGifts.filter(g => g.item_id === normalizedItemId);
+    if (matched.length > 0) {
+      if (normalizedUpgradeLevel !== null) {
+        const exact = matched.find(g => (g.upgrade_level || 0) === normalizedUpgradeLevel);
+        if (exact) return exact;
+      }
+      if (/12|十二/.test(h)) {
+        const plus12 = matched.find(g => (g.upgrade_level || 0) === 12);
+        if (plus12) return plus12;
+      }
+      return matched[0];
+    }
+  }
+
+  // 2. 状态机场景路由（严禁 Math.random 盲抽）
+  switch (scenario) {
+    case MAIL_SCENARIOS.EQUIP_BROKEN: {
+      // 碎刀送垫刀/碳
+      if (/碳|炉岩/.test(h)) {
+        return allGifts.find(g => g.category === 'catalyst' || g.item_id === 3171)
+          || allGifts.find(g => g.category === 'pad_weapon');
+      }
+      if (/12|十二|万仞|极品/.test(h)) {
+        return allGifts.find(g => g.category === 'pad_weapon' && g.upgrade_level === 12)
+          || allGifts.find(g => g.category === 'pad_weapon');
+      }
+      // 默认碎刀送 +11 垫刀
+      return allGifts.find(g => g.category === 'pad_weapon' && g.upgrade_level === 11)
+        || allGifts.find(g => g.category === 'pad_weapon')
+        || allGifts.find(g => g.item_id === 3171);
+    }
+
+    case MAIL_SCENARIOS.ABYSS_BLANK: {
+      // 深渊光头/空手送深渊票
+      const ticket = allGifts.find(g => g.category === 'abyss_ticket' || g.item_id === 3214);
+      if (ticket) return ticket;
+      break;
+    }
+
+    case MAIL_SCENARIOS.OFFLINE_CARE:
+    default: {
+      // 晚安送水/日常补给，杜绝高强武器
+      if (/圣经|回避|保命|无头/.test(h)) {
+        const bible = allGifts.find(g => g.category === 'special' || g.item_id === 1070);
+        if (bible) return bible;
+      }
+      if (/无色|大招|晶块|报销/.test(h)) {
+        const cube = allGifts.find(g => g.category === 'cube' || g.item_id === 3174);
+        if (cube) return cube;
+      }
+      // 默认送天空之城泉水
+      const water = allGifts.find(g => g.category === 'recovery' || g.item_id === 1048);
+      if (water) return water;
+      const safeDaily = allGifts.find(g => g.category !== 'pad_weapon' && (g.upgrade_level || 0) === 0);
+      if (safeDaily) return safeDaily;
+    }
+  }
+
+  // 安全保底：天空之城泉水
+  return allGifts.find(g => g.item_id === 1048) || allGifts[0];
+}
 
 // ── 2.2 方案B：拟人化打字机动量与短句切分器（Sentence Burst Chunker） ────────
 const EMOJI_MAP = [
@@ -526,18 +687,30 @@ gameRouter.post('/game/chat', async (req, res) => {
   });
 });
 
-// ── POST /game/mail：游戏邮件生成（含合规附件与本地保底） ────────────────────
+// ── POST /game/mail：游戏邮件生成（含情境状态机附件与本地保底） ────────────────────
 gameRouter.post('/game/mail', async (req, res) => {
   const npc = req.body?.npc;
   const hint = String(req.body?.hint ?? '').trim().slice(0, 500);
-  const targetItemId = Number(req.body?.attach_item_id || 0);
+  const scenarioInput = req.body?.scenario || req.body?.event_type;
+  const targetItemId = Number(req.body?.attach_item_id || req.body?.item_id || 0);
+  const targetUpgradeLevel = req.body?.upgrade_level !== undefined ? Number(req.body.upgrade_level) : null;
 
   const c = findCompanion(npc);
   if (!c) return res.status(404).json({ ok: false, error: `恋人 NPC 不存在: ${npc}` });
 
-  // 1. 选取合规礼物（优先匹配指定 item_id，否则随机）
-  const gift = DNF_LEGIT_MAIL_GIFTS.find(g => g.item_id === targetItemId)
-            || DNF_LEGIT_MAIL_GIFTS[Math.floor(Math.random() * DNF_LEGIT_MAIL_GIFTS.length)];
+  // 1. 解析情境与选取专属礼物（废除 Math.random 盲抽，绑定情境状态机）
+  const scenario = resolveMailScenario({
+    scenario: scenarioInput,
+    hint,
+    targetItemId
+  });
+
+  const gift = selectMailGift({
+    scenario,
+    hint,
+    targetItemId,
+    targetUpgradeLevel
+  });
 
   const isTuanzi = c.name.includes('团子');
   const localDefault = isTuanzi ? gift.dialogue.tuanzi : gift.dialogue.peach;
@@ -549,7 +722,7 @@ gameRouter.post('/game/mail', async (req, res) => {
   try {
     const personaPrompt = buildSystemPrompt(c, { promptMode: 'reply' });
     const instruction = [
-      `现在你要在 DNF 塞拉邮局给冒险家寄信，随信附赠了：【${gift.name} × ${gift.count}】。`,
+      `现在你要在 DNF 塞拉邮局给冒险家寄信，触发情境：【${scenario}】。随信附赠了：【${gift.name} × ${gift.count}】。`,
       `寄信由头：${gift.reason}。${hint ? '额外背景：' + hint : ''}`,
       '严格按以下格式输出，不要输出任何其他内容：',
       '第一行：`标题：<不超过14字的邮件标题>`',
@@ -597,6 +770,7 @@ gameRouter.post('/game/mail', async (req, res) => {
   return res.json({
     ok: true,
     npc: c.name,
+    scenario,
     title: mailResult.title,
     body: mailResult.body,
     attachment: {

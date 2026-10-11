@@ -11,10 +11,21 @@
 
 import { existsSync } from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
+
+/**
+ * 跨平台动态 import。
+ * 修 Windows 路径 bug：`import(path.join(ROOT, 'src/x.mjs'))` 传的是原生路径
+ * （`D:\GitHub\...`），默认 ESM loader 只接受 file/data/node 协议，
+ * 会抛 "Only URLs with a scheme in: file, data, and node are supported …
+ * Received protocol 'd:'" —— 导致本脚本在 Windows 上 6 个 import 断言恒红。
+ */
+function importModule(rel) {
+  return import(pathToFileURL(path.join(ROOT, rel)).href);
+}
 
 let passed = 0;
 let failed = 0;
@@ -42,7 +53,7 @@ check('/app/dashboard.html 存在',    fileExists('public/app/dashboard.html'));
 
 // ─── 3. memory_v2.mjs exports ────────────────────────────────────────────────
 try {
-  const m = await import(path.join(ROOT, 'src/memory_v2.mjs'));
+  const m = await importModule('src/memory_v2.mjs');
   check('memory_v2 exportiert computeMemoryDecay',          typeof m.computeMemoryDecay === 'function');
   check('memory_v2 exportiert shouldWriteBackDecay',        typeof m.shouldWriteBackDecay === 'function');
   check('memory_v2 exportiert applyMemoryDecayBatch',       typeof m.applyMemoryDecayBatch === 'function');
@@ -56,7 +67,7 @@ try {
 
 // ─── 4. persona_guard.mjs exports ────────────────────────────────────────────
 try {
-  const m = await import(path.join(ROOT, 'src/persona_guard.mjs'));
+  const m = await importModule('src/persona_guard.mjs');
   const exportedFns = Object.values(m).filter(v => typeof v === 'function');
   check('persona_guard.mjs 至少导出 1 个函数', exportedFns.length >= 1);
 } catch (e) {
@@ -65,7 +76,7 @@ try {
 
 // ─── 5. emotion_state.mjs exports ────────────────────────────────────────────
 try {
-  const m = await import(path.join(ROOT, 'src/emotion_state.mjs'));
+  const m = await importModule('src/emotion_state.mjs');
   check('emotion_state exportiert getEmotionStateWithDefaults', typeof m.getEmotionStateWithDefaults === 'function');
   check('emotion_state exportiert updateEmotionFromUserMessage', typeof m.updateEmotionFromUserMessage === 'function');
   check('emotion_state exportiert buildEmotionPromptHint',       typeof m.buildEmotionPromptHint === 'function');
@@ -77,7 +88,7 @@ try {
 
 // ─── 6. proactive_engine.mjs exports ─────────────────────────────────────────
 try {
-  const m = await import(path.join(ROOT, 'src/proactive_engine.mjs'));
+  const m = await importModule('src/proactive_engine.mjs');
   check('proactive_engine exportiert evaluateProactive',   typeof m.evaluateProactive === 'function');
   check('proactive_engine exportiert computeMissingScore', typeof m.computeMissingScore === 'function');
   check('proactive_engine exportiert shouldBackoffProactive', typeof m.shouldBackoffProactive === 'function');
@@ -87,7 +98,7 @@ try {
 
 // ─── 7. reflection.mjs exports ───────────────────────────────────────────────
 try {
-  const m = await import(path.join(ROOT, 'src/reflection.mjs'));
+  const m = await importModule('src/reflection.mjs');
   check('reflection exportiert runDailyReflectionForCompanion',  typeof m.runDailyReflectionForCompanion === 'function');
   check('reflection exportiert runWeeklyReflectionForCompanion', typeof m.runWeeklyReflectionForCompanion === 'function');
   check('reflection exportiert buildReflectionPrompt',           typeof m.buildReflectionPrompt === 'function');
@@ -111,7 +122,7 @@ try {
 
 // ─── 9. memory_v2 sensitive filter functional test ───────────────────────────
 try {
-  const m9 = await import(path.join(ROOT, 'src/memory_v2.mjs'));
+  const m9 = await importModule('src/memory_v2.mjs');
   // Use a clearly fake key that matches the API key pattern (no real key)
   const fakeKey = 'sk-' + 'x'.repeat(21);
   const detects = m9.isSensitiveMemoryContent(fakeKey);
@@ -262,7 +273,7 @@ try {
 check('src/event_graph.mjs 存在', fileExists('src/event_graph.mjs'));
 
 try {
-  const eg = await import(path.join(ROOT, 'src/event_graph.mjs'));
+  const eg = await importModule('src/event_graph.mjs');
   check('event_graph 导出 shouldProcessMemoryForGraph',      typeof eg.shouldProcessMemoryForGraph === 'function');
   check('event_graph 导出 extractSimpleEntitiesFromMemory',  typeof eg.extractSimpleEntitiesFromMemory === 'function');
   check('event_graph 导出 processMemoryForGraph',            typeof eg.processMemoryForGraph === 'function');

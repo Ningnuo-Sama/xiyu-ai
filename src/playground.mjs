@@ -14,7 +14,7 @@
  */
 
 import { log } from './logger.mjs';
-import { generateReply, embedText } from './ai.mjs';
+import { generateReply, embedText, consumeReplyFailure, markReplyFailureInto, LLM_FALLBACK_REPLY } from './ai.mjs';
 import {
   recallMemoriesSemantic, recallMemories, getUserProfile, getConversationContext,
   getDailySchedule, getRecentSchedules, getPersonaFacts, shanghaiDateKey,
@@ -34,6 +34,7 @@ import { buildStickerPromptHint, hasStickers, parseStickerMarkers } from './stic
 import {
   getEmotionStateWithDefaults, updateEmotionFromUserMessage,
   updateEmotionFromAssistantReply, buildEmotionPromptHint, getMissingLevel,
+  getNeglectStage, buildReunionHint,
 } from './emotion_state.mjs';
 import { generateInnerMonologue, buildInnerOsHint } from './inner_os.mjs';
 import { extractOpenLoops, detectAndResolveOpenLoops } from './open_loops.mjs';
@@ -41,16 +42,44 @@ import { extractOpenLoops, detectAndResolveOpenLoops } from './open_loops.mjs';
 /**
  * @param {object} companion 由调用方查好的 companion 行
  * @param {string} userText 用户输入（文本）
- * @returns {Promise<{reply:string, segments:string[], state:{mood, affection_level, relationship_stage}}>}
+ * @param {object} [opts]
+ * @param {boolean} [opts.probe=false] 探针模式：跑链路但零持久化（见下）
+ * @param {object} [opts.failureSink] P0-B 请求级失败观测对象。传入后，若本次回复来自
+ *   LLM 失败兜底（正文 = LLM_FALLBACK_REPLY），该对象会被写入 `{failed:true, reason}`；
+ *   调用方据此把 `source` 标成 `api_fallback`。**请求级对象，天然无并发竞态**（见 ai.mjs 注释）。
+ * @returns {Promise<{reply:string, segments:object[], state:object, apiFailed:boolean, apiFailureReason:string|null, neglectStage:string, stateUpdated:boolean}>}
+ *   注：本函数**不再**在生成失败时 throw——生成失败会退回 LLM_FALLBACK_REPLY 并置
+ *   `apiFailed=true`，由调用方按 source 契约决定是否换成本地语料（见 game_dnf.mjs）。
+ *   这样做的原因：状态推进（好感/心情/阶段）不应因一次生成失败而丢掉。
  */
 // probe（探针模式）：跑通整条对话链路（含 #310 的 inner-OS double-pass）但**零持久化**——
 // 不写 conversation turns / memory / emotion / profile / safety / open loops / postProcess。
 // 供 scripts/playground_probe.mjs 每日合成探针用（对外通道心跳），配合合成 companion id<0 双保险。
-export async function playgroundChat(companion, userText, { probe = false } = {}) {
+export async function playgroundChat(companion, userText, { probe = false, failureSink = null } = {}) {
   if (!companion) throw new Error('companion 不存在');
   const text = String(userText || '').trim();
   if (!text) throw new Error('userText 不能为空');
   if (text.length > 2000) throw new Error('userText 过长（>2000）');
+
+  // 先留一句"他说的原话没变"，供下面的 last_user_reply_at 写回前判定
+  const _prevLastUserReplyAt = companion.last_user_reply_at || null;
+
+  // ── P0-A：写回「他刚刚真的说话了」 ─────────────────────────────────────────
+  // 这是 companions.last_user_reply_at 在 DNF 链路上的**唯一写入点**。
+  // 此前全仓只有 proactive_engine.mjs:321 的 recordUserReplied 会写，而它只在 proactive
+  // 链路被调用 → DNF 链路该列恒 null → getNeglectStage / buildReunionHint / getMissingLevel
+  // / runArcTimeTickBatch / checkProactiveDeadman 全部静默失效。
+  // 刻意放在**生成之前**（而不是末尾）：真实玩家发过话就是事实，不该因为 LLM 挂掉、
+  // 超时熔断或任何后续异常而丢失这个事实。放在这里也天然保证下面的重逢提示读到的
+  // 是"本轮之前"的空窗（_prevLastUserReplyAt 已在函数入口留档）。
+  // best-effort：写失败只记日志，绝不阻断回复。
+  if (!probe) {
+    try {
+      patchCompanion(companion.id, { last_user_reply_at: new Date().toISOString() });
+    } catch (e) {
+      log('warn', `[Playground] last_user_reply_at 写回失败 companion=${companion.id}: ${e.message}`);
+    }
+  }
 
   // v1.10.6: 睡眠拦截（与微信端 bot.mjs 一致）。睡着了网页也不回复，前端显示"睡眠中"。
   // maybeSleepBlock 内含挽留延后逻辑：用户说"再陪陪我/别睡"等会延后入睡继续聊。
@@ -131,10 +160,23 @@ export async function playgroundChat(companion, userText, { probe = false } = {}
   // v1.8.0 #3: preferences 结构化偏好账本
   const preferences = getCompanionPreferencesForPrompt(companion.id);
 
+  // ── P0-A：冷落/重逢接进回复路径 ────────────────────────────────────────────
+  // 用**本轮之前**的 last_user_reply_at（函数入口已留档为 _prevLastUserReplyAt）算冷落档，
+  // 这正是"他多久没说话了"的语义。必须用留档值而不是重查 companion：本轮开头的写回
+  // 已经把 DB 里的值刷成"现在"了，读它只会得到 0 秒空窗、重逢永不触发。
+  let neglectStage = 'none';
+  let reunionHint = '';
+  try {
+    neglectStage = getNeglectStage(_prevLastUserReplyAt, companion.attachment_style);
+    reunionHint = buildReunionHint(neglectStage, companion.attachment_style, _prevLastUserReplyAt) || '';
+  } catch (e) {
+    log('warn', `[Playground] reunion hint 失败 companion=${companion.id}: ${e.message}`);
+  }
+
   let systemPrompt = buildSystemPrompt(companion, {
     memories, userProfile, recentTurns, longTermDigest,
     promptMode: 'reply', dailySchedule, recentSchedules, personaFacts, preferences,
-  }) + stickerHint + emotionHint;
+  }) + stickerHint + emotionHint + reunionHint;
 
   // 关系刚升级
   const celebration = probe ? null : consumePendingCelebration(companion.id);   // consume=写，探针跳过
@@ -188,17 +230,47 @@ export async function playgroundChat(companion, userText, { probe = false } = {}
   }
 
   let reply;
+  let genThrow = null;
   try {
     reply = await generateReply(systemPrompt, history, text, {
       temperature: companion.temperature,
       max_tokens: companion.max_tokens,
       top_p: companion.top_p,
       safetyLevel: userMsgSafetyLevel,  // v1.9.1: high/medium 时收紧温度
+    }, {
+      // 探针模式必须传 null：探针用合成 companion（id=-1），一旦把该 id 交给
+      // generateReply 的 ctx，provider 层就会往 `ai_usage_events` 写一条 id=-1 的记录，
+      // 破坏"探针零污染"约束（playground_probe_smoke ⑦ 会红）。原实现根本不传 ctx，
+      // 等价于 null；这里保持同一语义。failureSink 是普通对象，与 id 无关，照常传。
+      companionId: probe ? null : companion.id,
+      failureSink,
     });
   } catch (err) {
+    // 注意：provider 层存在**会向上抛**的失败路径（例如未配置 API key 时
+    // providers/chat.mjs 直接 throw），这类失败不会经过 generateReply 的 catch，
+    // 因此不会写 failureSink。这里就地补记，保证"失败可见"覆盖两条路径。
+    genThrow = err;
     log('error', `[Playground] generateReply 失败 companion=${companion.id}: ${err.message}`);
-    throw err;
+    // 不再直接 rethrow：DNF 适配层需要一个**有回复**的结果（它自己会按 source 分流）。
+    // 本函数仍保证「要么返回完整结构，要么抛」的一致性——下方统一走本地兜底再返回。
+    reply = null;
   }
+  // P0-A + P0-B 的行为约定：只要玩家说了话，本轮就必须产出「可用的回复 + 已推进的状态」。
+  // 生成失败时用一句通用兜底承接（DNF 适配层会按 source=api_fallback 决定是否换成本地语料）；
+  // 关键是不能让状态写回被这次失败吞掉——否则好感/心情会停在原地（正是旧实现的隐性缺陷）。
+  if (genThrow) {
+    // 把"上游抛出的失败"补记进请求级 sink，让 DNF 适配层能拿到失败原因
+    markReplyFailureInto(failureSink, String(genThrow.message || 'llm_failed'));
+  }
+  if (!reply) {
+    // 与 ai.mjs 共用同一份文案（LLM_FALLBACK_REPLY），避免两处硬编码漂移
+    reply = LLM_FALLBACK_REPLY;
+  }
+  // 失败判定：两条路径合流——① generateReply 内部吞掉的失败（写了 sink/map）
+  // ② provider 层向上抛的失败（已在上方补记进 sink）。
+  const aiFailure = (failureSink?.failed || genThrow)
+    ? { failed: true, reason: String(failureSink?.reason || genThrow?.message || 'llm_failed').slice(0, 200) }
+    : consumeReplyFailure(companion.id);
   reply = safeOutboundReply(reply);
   reply = scrubPhotoImpersonation(reply, companion.id);   // #281：playground 无照片链路，同罩
 
@@ -206,6 +278,21 @@ export async function playgroundChat(companion, userText, { probe = false } = {}
   try {
     if (!probe) updateEmotionFromAssistantReply(companion.id, emotionState, reply, { companion });
   } catch { /* 情绪更新失败不影响主链路 */ }
+
+  // ── P0-A：把「好感推进」从异步后处理提到响应之前 ───────────────────────────
+  // 原实现把 syncUpdateCompanionState 放在下面的 fire-and-forget IIFE 里（虽因它是同步
+  // 函数而在同一 turn 内生效，但依赖"IIFE 内无前置 await"这一隐式前提，脆弱且难断言）。
+  // 移到此处后：① 响应里的 mood/affection/stage 一定是本次生成后的最新值；
+  // ② 记忆抽取等真正的慢操作仍留在异步块里，不阻塞响应。
+  let stateUpdated = false;
+  if (!probe) {
+    try {
+      syncUpdateCompanionState(companion, text, reply);
+      stateUpdated = true;
+    } catch (e) {
+      log('warn', `[Playground] state update 失败 companion=${companion.id}: ${e.message}`);
+    }
+  }
 
   // 拆段（与 bot.mjs 同款 || 拆分），并把 [STICKER:xxx] 标记原样保留在 segments 里
   const segments = String(reply).split(/\s*(?:\|\||｜｜)\s*/g).map(s => s.trim()).filter(Boolean);
@@ -234,10 +321,11 @@ export async function playgroundChat(companion, userText, { probe = false } = {}
     try { detectAndResolveOpenLoops(companion.id, text); }
     catch (e) { log('warn', `[Playground] resolve loop: ${e.message}`); }
 
-    // 后处理（异步，不阻塞响应）：好感度 + 心情 + 记忆提取 + open loops 抽取
+    // 后处理（异步，不阻塞响应）：记忆提取 + open loops 抽取。
+    // 注：syncUpdateCompanionState（好感/阶段/心情）已在上方提前同步执行（P0-A），
+    // 不在这里重复调用——这是响应里的状态能"不慢一轮"的前提。
     (async () => {
       try {
-        syncUpdateCompanionState(companion, text, reply);
         if (companion.memory_enabled) {
           await extractAndSaveMemories(companion.id, companion.user_id, text, reply);
           await extractAndUpdateUserProfile(companion.id, companion.user_id, text);
@@ -251,7 +339,8 @@ export async function playgroundChat(companion, userText, { probe = false } = {}
     })();
   }
 
-  // 返回最新 companion 状态给前端实时显示
+  // 返回最新 companion 状态给前端实时显示。
+  // P0-A：syncUpdateCompanionState 已同步执行完，这里重查拿到的就是本次生成后的最新值。
   const after = getCompanionById(companion.id) || companion;
 
   return {
@@ -262,5 +351,13 @@ export async function playgroundChat(companion, userText, { probe = false } = {}
       affection_level: after.affection_level,
       relationship_stage: after.relationship_stage,
     },
+    // P0-A/B 透出给 DNF 适配层：
+    //   apiFailed     —— 本次回复是否来自 LLM 失败兜底（决定 source 是 api 还是 api_fallback）
+    //   neglectStage  —— 本轮判定出的冷落档（诊断/日志用）
+    //   stateUpdated  —— 状态写回是否成功（诊断用）
+    apiFailed: !!aiFailure.failed,
+    apiFailureReason: aiFailure.reason || null,
+    neglectStage,
+    stateUpdated,
   };
 }

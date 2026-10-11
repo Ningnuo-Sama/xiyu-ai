@@ -284,6 +284,85 @@ function stripActionNarration(text) {
   return unwrapped.length ? unwrapped : text;
 }
 
+// ─── P0-B：chat 失败的可见化标记（DNF 大脑「双轨诚实化」） ────────────────────
+// 为什么不用「改控制流抛异常」：generateReply 有 10 个调用方（bot / api / proactive /
+// photo_sender / plan_tasks / inner_os / 4 个 sandbox），抛异常会逐个打断它们。
+// 为什么不用「reply === FALLBACK 字符串比较」：那条路上 `text` 为空时也会返回 FALLBACK，
+// 与真失败同值——字符串比较无法区分「provider 挂了」与「provider 通了但返回空」。
+//
+// 两条并存通道，按可靠性排序：
+//  ① 首选 · 请求级 sink（无竞态）：调用方传 `ctx.failureSink`（一个普通对象），
+//     失败结果直接写在那**这次请求独有的对象**上。同一 companion 并发两个请求时
+//     各自持有自己的 sink，互不干扰；也不存在「没人 consume 而残留」。
+//  ② 兜底 · companion 维度的 map（向后兼容旧调用方 + 诊断用）：仅当没传 sink 时才写。
+//     为避免「上一次调用留下的标记被下一次调用误读」，map 里额外记一个全局调用序号
+//     callSeq；consume/peek 时要求标记的 callSeq === 当前序号（即「最近一次调用」），
+//     否则判为陈旧标记直接丢弃——语义是「标记只代表最近一次调用」。
+const _replyFailures = new Map();      // companionId(or '__global__') -> { at, reason, callSeq }
+let _replyCallSeq = 0;
+const _REPLY_FAILURE_MAX = 200;        // 防御性上限，防长跑累积
+
+/**
+ * LLM 全线失败时返回给用户的固定兜底句。
+ * **导出**是为了让上层（playground.mjs）复用同一份文案，避免两处硬编码漂移——
+ * 上层拿到它时配合 `failureSink.failed` 判定，即可把 source 正确标成 `api_fallback`。
+ */
+export const LLM_FALLBACK_REPLY = '嗯…我刚刚有点走神，等我一下下，再跟你说～';
+
+/**
+ * 把一个「失败结果」写进请求级 sink。sink 由调用方提供，生命周期与请求一致。
+ * @returns {boolean} 是否成功写入（sink 非法时返回 false）
+ */
+export function markReplyFailureInto(sink, reason) {
+  if (!sink || typeof sink !== 'object') return false;
+  sink.failed = true;
+  sink.reason = String(reason || 'unknown').slice(0, 200);
+  sink.at = Date.now();
+  return true;
+}
+
+function _markReplyFailure(companionId, err, sink) {
+  const reason = String(err?.message || err || 'unknown').slice(0, 200);
+  // ① 请求级 sink：最可靠，无跨请求串味
+  if (markReplyFailureInto(sink, reason)) return;
+  // ② 无 sink 时的兜底（旧调用方）：按 companion 维度 + 调用序号
+  const key = companionId ?? '__global__';
+  _replyFailures.set(key, { at: Date.now(), reason, callSeq: _replyCallSeq });
+  if (_replyFailures.size > _REPLY_FAILURE_MAX) {
+    let oldestKey = null, oldestAt = Infinity;
+    for (const [k, v] of _replyFailures) if (v.at < oldestAt) { oldestAt = v.at; oldestKey = k; }
+    if (oldestKey !== null) _replyFailures.delete(oldestKey);
+  }
+}
+
+function _clearReplyFailure(companionId) {
+  if (companionId === undefined || companionId === null) return;
+  _replyFailures.delete(companionId);
+}
+
+/**
+ * 取走「该 companion 最近一次 generateReply 是否失败」的兜底标记（读即消费，防串场）。
+ * 仅在调用方没走请求级 sink 时才有内容。陈旧标记（非最近一次调用）一律判为无失败。
+ * @param {number|string|null} companionId
+ * @returns {{failed:boolean, reason:string|null, at:number|null}}
+ */
+export function consumeReplyFailure(companionId) {
+  const key = companionId ?? '__global__';
+  const hit = _replyFailures.get(key);
+  if (!hit) return { failed: false, reason: null, at: null };
+  _replyFailures.delete(key);                                  // 读即消费
+  if (hit.callSeq !== _replyCallSeq) return { failed: false, reason: null, at: null };
+  return { failed: true, reason: hit.reason, at: hit.at };
+}
+
+/** 只读窥探（不消费），供探针/诊断使用；陈旧标记同样判为无失败。 */
+export function peekReplyFailure(companionId) {
+  const key = companionId ?? '__global__';
+  const hit = _replyFailures.get(key);
+  if (!hit || hit.callSeq !== _replyCallSeq) return { failed: false, reason: null, at: null };
+  return { failed: true, reason: hit.reason, at: hit.at };
+}
+
 export async function generateReply(personaPrompt, history, userMessage, params = {}, ctx = {}) {
   // v1.2.10: 兜底默认与 companions 表 DEFAULT 对齐 (0.8 / 3000 / 0.95)，
   // 让回复更有创意、空间更宽、用词更自然。caller 显式传值会优先。
@@ -329,8 +408,12 @@ export async function generateReply(personaPrompt, history, userMessage, params 
   }
 
   log('debug', `[ai] chat messages=${messages.length} temp=${temperature}`);
-  const FALLBACK = '嗯…我刚刚有点走神，等我一下下，再跟你说～';
+  const FALLBACK = LLM_FALLBACK_REPLY;
   try {
+    // P0-B（DNF 大脑双轨诚实化）：本次调用开始——推进调用序号（供兜底标记判「是否最近一次」），
+    // 并清掉该 companion 上可能残留的旧标记，保证标记只反映**本次**调用。
+    _replyCallSeq += 1;
+    _clearReplyFailure(companionId);
     const { text, usage } = await chatCompleteWithRetry({
       system: effectiveSystem,
       messages,
@@ -368,6 +451,12 @@ export async function generateReply(personaPrompt, history, userMessage, params 
       accountId, companionId, provider: process.env.CHAT_PROVIDER, model: process.env.CHAT_MODEL,
       capability: 'chat', latencyMs: Date.now() - _t0, status: 'error',
     });
+    // P0-B：失败**可见化**。这里刻意不抛（抛会打断 bot/api/proactive/photo 等 10 个
+    // 既有调用方的控制流），而是把「本次调用失败」写进调用方给的请求级 sink；
+    // 调用方没给 sink 时落到 companion 维度的兜底 map。上层据此把 source 标成
+    // api_fallback（因为此刻正文就是这句固定兜底句），使「API 挂」与「API 通」在响应里
+    // 可区分——修掉「失败被自愈掩盖」。
+    _markReplyFailure(companionId, err, ctx?.failureSink);
     return FALLBACK;
   }
 }

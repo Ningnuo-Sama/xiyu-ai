@@ -17,6 +17,7 @@ import { log } from './logger.mjs';
 import { Router } from 'express';
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import { getDb, parseCompanionRow } from './db.mjs';
 import { playgroundChat } from './playground.mjs';
 import { buildSystemPrompt } from './companion.mjs';
@@ -26,6 +27,92 @@ export const gameRouter = Router();
 
 // 超时门限：4.0秒内未完成则快速熔断切本地，既给在线大模型充足生成时间，又符合真人打字延迟（“对方正在输入中…”）
 const CHAT_TIMEOUT_MS = Number(process.env.CHAT_API_TIMEOUT_MS || 4000);
+
+// ── 0. `source` 取值契约（与 Go 侧对齐；改动前先读这段） ───────────────────────
+/**
+ * `source` 是大脑告诉游戏服务端「这条回复是怎么来的」的唯一凭据，Go 侧据此决定
+ * 是否丢弃并改走自己的兜底池。取值域**冻结为 7 个**（评审 B-1：早期方案只列 5 个，
+ * 漏掉了大脑既有的 `proactive_shuffle` 和 Go 侧既有的 `fallback`，会把两条既有路径
+ * 判成未知值）：
+ *
+ * | 值                  | 谁产出        | 含义（**看正文是什么，不看"有没有失败"**） | Go 侧处置        |
+ * |---------------------|--------------|--------------------------------------|------------------|
+ * | `api`               | 大脑 /game/chat | LLM 真实生成成功                      | 正常转录          |
+ * | `api_fallback`      | 大脑 /game/chat | LLM 调用失败，**正文是固定兜底句**（"走神"那句） | **丢弃**，走本地池 |
+ * | `local`             | 大脑 /game/chat | **正文是本地语料**（含"在线路径整体失败后回落本地"这种情况） | 正常转录 |
+ * | `proactive_shuffle` | 大脑 /game/chat | 主动问候短路（洗牌袋直出），**语义等价 local** | 正常转录 |
+ * | `sleeping`          | 大脑 /game/chat | 她处于睡眠时段，未回复                | 按「她睡了」处理，不转录 |
+ * | `error`             | 大脑 /game/chat | 请求本身失败（无 NPC / 入参非法）      | **丢弃**          |
+ * | `go_fallback`       | **仅 Go 侧**  | Go 自己兜底（`client.go` 的 `Source:"fallback"`） | 不出现在大脑响应里，仅用于日志/去重 |
+ *
+ * **两条容易搞反的语义（定调 §17 已冻结，改动前先读）**：
+ *   · `api_fallback` 的判据是「**正文是固定兜底句**」→ Go 必须丢弃。
+ *   · `local` 的判据是「**正文是本地语料**」→ Go 正常转录；**"在线失败后回落到本地语料"
+ *     仍属 `local`**。此时"LLM 此刻不可用"这个信息由 `source_reason`（如
+ *     `online_path_failed`）与计数承载——**不能靠把好内容错标成 `api_fallback` 来表达**，
+ *     否则 Go 会把本来可用的本地语料当垃圾丢掉，比不改还糟。
+ *
+ * **未知值降级规则（硬约定）**：任何不在上表内的值，一律按 `api_fallback` 处理
+ * （=「不认识 ⇒ 不许当成功」）。大脑侧由 `normalizeSource()` 强制兜住，保证自己
+ * 永不产出未知值；同时这条规则是写给 Go 侧的对齐要求。
+ */
+export const SOURCE = {
+  API: 'api',
+  API_FALLBACK: 'api_fallback',
+  LOCAL: 'local',
+  PROACTIVE_SHUFFLE: 'proactive_shuffle',
+  SLEEPING: 'sleeping',
+  ERROR: 'error',
+  GO_FALLBACK: 'go_fallback',
+};
+
+const SOURCE_VALUES = new Set(Object.values(SOURCE));
+
+/**
+ * 把任意值收敛到契约取值域内。**未知值一律降级为 api_fallback**——宁可让 Go 侧
+ * 多走一次本地兜底，也不能让一个不认识的状态被当成"在线成功"。
+ * @param {string} value
+ * @returns {string} 契约内的 source
+ */
+export function normalizeSource(value) {
+  const v = String(value ?? '').trim();
+  if (SOURCE_VALUES.has(v)) return v;
+  log('warn', `[Game] 未知 source "${v}" → 按 ${SOURCE.API_FALLBACK} 降级处理（契约见 SOURCE 常量表）`);
+  return SOURCE.API_FALLBACK;
+}
+
+// ── 0.1 语料加载失败的可见化（评审 B-4） ──────────────────────────────────────
+// 原实现 `catch { return 旧缓存 }` 是完全静默的：语料 JSON 写坏了、被就地编辑成非法
+// 格式时，服务表现为「还在用旧语料」且**一条日志都没有**，直接导致"改了语料看不见
+// 效果且没人报错"。这里补两件确定性的事：
+//   ① 每次都打 WARN（含文件路径与错误原因），让"改了不生效"在日志里一眼可见；
+//   ② 只在内容哈希变化时打，避免坏文件把日志刷爆（同一份坏内容只喊一次）。
+const _corpusWarnSeen = new Map();   // filePath -> 上次告警的内容指纹
+
+function warnCorpusFallback(kind, filePath, err, sha1) {
+  const prev = _corpusWarnSeen.get(filePath);
+  if (prev === sha1) return;          // 同一份坏内容已喊过，不重复刷
+  _corpusWarnSeen.set(filePath, sha1);
+  const cacheState = prev === undefined ? '（本次首次失败）' : '（内容又变了）';
+  const message = `${kind} 加载失败${cacheState}，已回落旧缓存：${filePath} — ${err?.message || err}`;
+  // 同时进「日志」（给人看）与「进程内计数」（给门禁断言看）。
+  // 只靠日志断言是不可靠的：logger 走 createWriteStream 异步刷盘，
+  // 测试进程可能在 flush 前就断言；进程内计数才是确定性的观测口。
+  log('warn', `[Game] ${message}`);
+  _corpusLoadFailures.push({ at: Date.now(), kind, filePath, message });
+  if (_corpusLoadFailures.length > 100) _corpusLoadFailures.shift();
+}
+
+const _corpusLoadFailures = [];   // 最近若干次语料加载失败（供门禁/诊断断言）
+
+/** 语料加载失败观测口（只读）。返回最近 N 条失败记录，含 message 与 filePath。 */
+export function getCorpusLoadFailures() { return _corpusLoadFailures.slice(); }
+
+/** 供诊断/门禁断言：查看某个语料当前生效的缓存（含 mtime），不触发重新加载。 */
+export function peekCorpusCache(name) {
+  const c = corpusCache[name];
+  return c ? { mtime: c.mtime, data: c.data } : null;
+}
 
 // ── 1. 角色解析（完全解绑微信，直接查 SQLite companions 表） ──────────────────
 function findCompanion(npc) {
@@ -102,7 +189,12 @@ const GAMER_GIRL_CHAT_FALLBACK = {
 };
 
 // ── 2.1 外置语料动态热更加载器（基于 mtime 自动热重载，无需重启服务） ─────────
-const CORPUS_DIR = path.resolve('data/dnf_corpus');
+// CORPUS_DIR 可用环境变量覆盖。默认值保持原样（`path.resolve('data/dnf_corpus')`，相对
+// 进程工作目录），零行为变化；覆盖能力是给测试用的——热更/坏文件/扩容门禁的自动化必须
+// 能在**临时目录**里跑，绝不能去写生产语料 `data/dnf_corpus/`。
+const CORPUS_DIR = process.env.CORPUS_DIR
+  ? path.resolve(process.env.CORPUS_DIR)
+  : path.resolve('data/dnf_corpus');
 const corpusCache = {
   peach: { mtime: 0, data: null },
   tuanzi: { mtime: 0, data: null },
@@ -138,6 +230,11 @@ function loadCorpusHot(name) {
     corpusCache[name] = { mtime: stat.mtimeMs, data: parsed };
     return parsed;
   } catch (err) {
+    // B-4：不再静默。文件存在却解析/读取失败 = 语料写坏了，必须可见（见 warnCorpusFallback）
+    if (fs.existsSync(filePath)) {
+      const sha1 = crypto.createHash('sha1').update(String(err?.message || err)).digest('hex');
+      warnCorpusFallback(`语料 ${name}`, filePath, err, sha1);
+    }
     return corpusCache[name]?.data || null;
   }
 }
@@ -155,6 +252,11 @@ function loadMailTemplatesHot() {
     corpusCache.mail = { mtime: stat.mtimeMs, data: parsed };
     return parsed;
   } catch (err) {
+    // B-4：同 loadCorpusHot —— 邮件模板写坏必须可见，不能"改了没生效还一声不吭"
+    if (fs.existsSync(filePath)) {
+      const sha1 = crypto.createHash('sha1').update(String(err?.message || err)).digest('hex');
+      warnCorpusFallback('邮件模板', filePath, err, sha1);
+    }
     return corpusCache.mail?.data || null;
   }
 }
@@ -185,7 +287,9 @@ function getLocalGamerGirlReply(companion, text, eventType = null) {
 
     // B. 时间与作息摸鱼借口（专治“为什么上课还在线/秒回”）
     if (/上课|为什么在线|怎么在线|还在玩|没睡|怎么还没睡|在干嘛|在干啥|查寝/.test(t)) {
-      let routineLines = null;
+      // 注：分支已覆盖所有小时区间（`else` 兜底），故不需要 `= null` 初始化
+      // （多写一个初值会被 eslint 的 no-useless-assignment 判为死赋值）。
+      let routineLines;
       if (hour >= 8 && hour < 12) routineLines = hotData.routine?.in_class;
       else if (hour >= 12 && hour < 14) routineLines = hotData.routine?.lunch;
       else if (hour >= 14 && hour < 17) routineLines = hotData.routine?.afternoon;
@@ -536,7 +640,10 @@ const EMOJI_MAP = [
   [/[\u{1F600}-\u{1F606}\u{1F60A}\u{1F60D}\u{1F618}\u{1F970}]/gu, '^ ^'],
   [/[\u{1F62D}\u{1F622}\u{1F97A}\u{1F625}]/gu, 'QAQ'],
   [/[\u{1F620}\u{1F621}\u{1F624}\u{1F92C}]/gu, '哼！'],
-  [/[\u{2764}\u{FE0F}\u{1F496}\u{1F495}\u{1F49E}\u{1F49F}\u{1F49B}\u{1F49C}\u{1F49D}]/gu, '[心]'],
+  // `\u{2764}` 常带变体选择符 `\u{FE0F}`（❤️）。变体选择符是**组合字符**，一旦与其它 emoji
+  // 挤进同一个字符类，eslint 会判 no-misleading-character-class。这里全部改成 alternation
+  // （不再有含组合字符的字符类），逐字符匹配语义不变：裸❤、❤️、孤立变体选择符都仍然清掉。
+  [/(?:\u{2764}\u{FE0F}|\u{2764}|\u{FE0F}|\u{1F496}|\u{1F495}|\u{1F49E}|\u{1F49F}|\u{1F49B}|\u{1F49C}|\u{1F49D})/gu, '[心]'],
   [/[\u{1F44D}]/gu, '[赞]'],
   [/[\u{1F44E}]/gu, '[踩]'],
   [/[\u{1F389}\u{1F388}\u{2728}\u{1F31F}]/gu, 'OvO'],
@@ -629,19 +736,25 @@ gameRouter.post('/game/chat', async (req, res) => {
       mood: c.current_mood,
       affection: c.affection_level,
       relationship_stage: c.relationship_stage,
-      source: 'proactive_shuffle'
+      // 契约：等价 local（未走 LLM 的本地洗牌袋直出）。见顶部 SOURCE 常量表。
+      source: SOURCE.PROACTIVE_SHUFFLE
     });
   }
 
   // 1. 尝试在线 LLM（带 1.5 秒硬超时）
-  let onlineResult = null;
-  let source = 'api';
+  // P0-B：failureSink 是**本次请求独有**的对象。playgroundChat 内部若命中
+  // generateReply 的失败兜底，会往它写 {failed:true, reason}，据此把 source 标成
+  // api_fallback。用请求级对象而非按 companion 查表，是为避免同一 NPC 并发请求互相串味。
+  // 注：不在声明处给 `null` 初值——try 与 catch 两条路径都会赋值，
+  // 多写的初值会被 eslint 的 no-useless-assignment 判为死赋值。
+  let onlineResult;
+  const failureSink = {};
 
   try {
     const timeoutPromise = new Promise((_, reject) =>
       setTimeout(() => reject(new Error('API_TIMEOUT')), CHAT_TIMEOUT_MS)
     );
-    const safeOnlineChat = playgroundChat(c, text).catch(err => {
+    const safeOnlineChat = playgroundChat(c, text, { failureSink }).catch(err => {
       log('warn', `[Game] 在线生成异常 npc=${c.name}: ${err.message}`);
       return null;
     });
@@ -651,8 +764,29 @@ gameRouter.post('/game/chat', async (req, res) => {
     onlineResult = null;
   }
 
-  // 2. 如果在线成功，返回在线内容（经方案B断句切分）
+  // 2. 在线分支返回（经方案B断句切分）
   if (onlineResult && onlineResult.reply) {
+    // 睡眠态单独成值：她没生成内容，只是"睡了"，不是失败也不是本地语料
+    if (onlineResult.sleeping) {
+      return res.json({
+        ok: true,
+        npc: c.name,
+        reply: '',
+        replies: [],
+        delays_ms: [],
+        overflow_mail: null,
+        sleeping: true,
+        mood: c.current_mood,
+        affection: c.affection_level,
+        relationship_stage: c.relationship_stage,
+        source: normalizeSource(SOURCE.SLEEPING),
+      });
+    }
+    // ★ P0-B 核心：LLM 失败兜底不再冒充成功。
+    // ai.mjs 的 catch 仍然 return FALLBACK（不打断 10 个既有调用方），但会往本次请求的
+    // failureSink 写 failed=true；这里据此把 source 从 api 分流为 api_fallback，
+    // 让 Go 侧能按契约丢弃并改走本地池——修掉"失败被自愈掩盖、玩家被告知 source:'api'"。
+    const apiFailed = !!failureSink.failed || !!onlineResult.apiFailed;
     const burst = chunkToBursts(onlineResult.reply);
     return res.json({
       ok: true,
@@ -661,15 +795,27 @@ gameRouter.post('/game/chat', async (req, res) => {
       replies: burst.replies,
       delays_ms: burst.delays_ms,
       overflow_mail: burst.overflow_mail,
-      sleeping: !!onlineResult.sleeping,
+      sleeping: false,
+      // ★ P0-A：状态即时化。playgroundChat 已把 syncUpdateCompanionState 提到响应之前
+      // 同步执行，所以 onlineResult.state 就是本次生成后的最新值。原实现用 c.* 兜底，
+      // 而 c 是**本轮开始前**查的行对象 → 玩家看到的好感/阶段永远慢一轮（已修）。
       mood: onlineResult.state?.mood ?? c.current_mood,
       affection: onlineResult.state?.affection_level ?? c.affection_level,
       relationship_stage: onlineResult.state?.relationship_stage ?? c.relationship_stage,
-      source: 'api'
+      source: normalizeSource(apiFailed ? SOURCE.API_FALLBACK : SOURCE.API),
+      ...(apiFailed ? { source_reason: onlineResult.apiFailureReason || failureSink.reason || 'llm_failed' } : {}),
+      // 诊断字段（非契约必需，Go 可忽略）：本轮冷落档
+      ...(onlineResult.neglectStage && onlineResult.neglectStage !== 'none'
+        ? { neglect_stage: onlineResult.neglectStage } : {}),
     });
   }
 
-  // 3. 【无感退本地】：命中本地短句语料（0ms 响应，绝不卡死）
+  // 3. 【无感退本地】：走本地短句语料（0ms 响应，绝不卡死）
+  // 语义（定调 §17 冻结，勿改）：能走到这里 = 在线 LLM 这条**已经尝试过**且 `playgroundChat`
+  // 整体 reject（超时熔断 / 生成链路异常）。此时**返回的正文是本地语料**，
+  // 所以 source 必须是 `local`——按契约 `api_fallback` 的含义是"正文是固定兜底句，Go 应丢弃"，
+  // 若这里错标 api_fallback，Go 会把**好内容当垃圾扔掉**（反而更糟）。
+  // "LLM 此刻不可用"这个信息由 `source_reason:'online_path_failed'` 与计数承载，不靠错标正文语义。
   const fallbackReply = getLocalGamerGirlReply(c, text, eventType);
   const burst = chunkToBursts(fallbackReply);
   return res.json({
@@ -683,7 +829,8 @@ gameRouter.post('/game/chat', async (req, res) => {
     mood: c.current_mood,
     affection: c.affection_level,
     relationship_stage: c.relationship_stage,
-    source: 'local'
+    source: normalizeSource(SOURCE.LOCAL),
+    source_reason: failureSink.reason || 'online_path_failed',
   });
 });
 
@@ -717,7 +864,9 @@ gameRouter.post('/game/mail', async (req, res) => {
 
   // 2. 尝试在线 LLM 生成邮件正文
   let mailResult = null;
-  let source = 'api';
+  let source = SOURCE.API;
+  // P0-B：邮件路径同样用请求级 failureSink 拿到"这次到底成功没成功"
+  const failureSink = {};
 
   try {
     const personaPrompt = buildSystemPrompt(c, { promptMode: 'reply' });
@@ -735,7 +884,8 @@ gameRouter.post('/game/mail', async (req, res) => {
       setTimeout(() => reject(new Error('API_TIMEOUT')), 3000)
     );
 
-    const safeGenerate = generateReply(personaPrompt, [], instruction, { max_tokens: 400 }, { companionId: c.id }).catch(err => {
+    const safeGenerate = generateReply(personaPrompt, [], instruction, { max_tokens: 400 },
+      { companionId: c.id, failureSink }).catch(err => {
       log('warn', `[Game] 邮件在线生成异常 npc=${c.name}: ${err.message}`);
       return null;
     });
@@ -759,8 +909,13 @@ gameRouter.post('/game/mail', async (req, res) => {
   }
 
   // 3. 降级回退到本地保底信件
+  // 语义（与 /game/chat 第 3 段同理）：generateReply 失败时不抛、返回固定兜底句，上面
+  // `raw.match(/标题[：:]/)` 匹配不到 → mailResult 为 null → 落到**本地保底信**
+  // （gift.dialogue.*，是本地内容，不是固定兜底句）。
+  // 因此 source 必须是 `local`（正文是本地语料，Go 应正常转录），
+  // "LLM 不可用"由 source_reason 承载——错标 api_fallback 会让 Go 丢掉这封本来可用的信。
   if (!mailResult) {
-    source = 'local';
+    source = SOURCE.LOCAL;
     mailResult = {
       title: gift.dialogue.title,
       body: localDefault
@@ -780,6 +935,7 @@ gameRouter.post('/game/mail', async (req, res) => {
       upgrade_level: gift.upgrade_level || 0,
       category: gift.category
     },
-    source
+    source: normalizeSource(source),
+    ...(failureSink.failed ? { source_reason: failureSink.reason || 'llm_failed' } : {}),
   });
 });

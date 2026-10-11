@@ -10,10 +10,14 @@
  */
 
 import 'dotenv/config';
-import { pathToFileURL } from 'node:url';
+import { pathToFileURL, fileURLToPath } from 'node:url';
 import path from 'node:path';
 
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
+// 修 Windows 路径 bug：`new URL(import.meta.url).pathname` 在 Windows 上得到
+// `/D:/GitHub/...`，path.resolve 再拼一次盘符 → `D:\D:\GitHub\...`，导致全部模块
+// "Cannot find module"。必须用 fileURLToPath（跨平台、去掉前导斜杠并还原盘符）。
+// 此前该脚本在 Windows 上恒为 0 pass / 21 fail（见 docs/handoff 的已知边界）。
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 const MODULES = [
   'src/db.mjs',

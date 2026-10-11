@@ -32,3 +32,21 @@ export function log(level, message) {
   console.log(line);
   if (logFileWritable && logFile) logFile.write(line + '\n');
 }
+
+/**
+ * 优雅关闭：把缓冲区刷盘并关闭文件流。
+ * 用途有两个——① 进程优雅退出时不丢最后几行日志；② 测试/门禁断言"日志里有没有这行"
+ * 之前需要一次确定性刷盘（createWriteStream 是异步的，不 flush 就断言会读到空文件）。
+ * 幂等：重复调用安全。
+ */
+export function closeLog() {
+  return new Promise((resolve) => {
+    if (!logFile) return resolve();
+    try {
+      logFile.end(() => { logFileWritable = false; resolve(); });
+    } catch {
+      logFileWritable = false;
+      resolve();
+    }
+  });
+}

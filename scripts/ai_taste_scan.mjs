@@ -31,9 +31,11 @@
 import 'dotenv/config';
 import fs from 'node:fs';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { pathToFileURL, fileURLToPath } from 'node:url';
 
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
+// 修 Windows 路径 bug：`.pathname` 会给出 `/D:/...`，path.resolve 再拼盘符 → `D:\D:\...`。
+// 必须用 fileURLToPath（跨平台）。此前该脚本在 Windows 上直接 ERR_MODULE_NOT_FOUND。
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 // ─── 解析参数 ────────────────────────────────────────────────────────────────
 const argv = process.argv.slice(2);

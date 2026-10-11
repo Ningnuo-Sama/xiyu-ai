@@ -385,11 +385,161 @@ function getLocalGamerGirlReply(companion, text, eventType = null) {
 }
 
 // ── 3. 塞拉邮局合规礼物清单与情境状态机（100% 60版本 Script.pvf 白盒核验真实道具ID） ───────────
+/**
+ * 邮件情境取值域（与 `data/dnf_corpus/mail_templates.json` 的 `scenario` 字段一一对应）。
+ *
+ * 前 3 个是 v1 既有情境；后 3 个是语料 v3 新增（定调 §18 T-7 移交）。
+ * **新增情境时必须同时改三处**：① 本表；② `SCENARIO_ALIASES`（把外部叫法收敛到本表）；
+ * ③ `resolveMailScenario` 末尾的 `KNOWN_MAIL_SCENARIOS` 派生集合会自动跟上；
+ * ④ `selectMailGift` 的 switch 补一个 case（否则走 `MAIL_SCENARIO_UNKNOWN` → fail-loud）。
+ *
+ * 另有一个**哨兵值** `MAIL_SCENARIO_UNKNOWN`：不属正常取值域，专门标识
+ * "调用方明确给了 scenario、但不认识"——它必须 fail-loud（见 resolveMailScenario）。
+ */
 export const MAIL_SCENARIOS = {
   EQUIP_BROKEN: 'equip_broken',
   OFFLINE_CARE: 'offline_care',
-  ABYSS_BLANK: 'abyss_blank'
+  ABYSS_BLANK: 'abyss_blank',
+  // ── 语料 v3 新增（mail_templates 的 scenario 字段名，必须逐字一致）──
+  REUNION: 'reunion',
+  ANNIVERSARY: 'anniversary',
+  AFTER_QUARREL: 'after_quarrel',
 };
+
+/**
+ * 未知情境哨兵。**不要在取值域里使用它**；它只由 `resolveMailScenario` 在
+ * "明确给了无法识别的 scenario" 时产出，用于把静默兜底变成可观测降级。
+ */
+export const MAIL_SCENARIO_UNKNOWN = '__unknown_scenario__';
+
+/**
+ * 外部叫法 → 规范情境。键为小写。
+ * 注意：这里只放"确实指向某情境"的同义词；**不要往里塞兜底**——
+ * 兜底是 `resolveMailScenario` 末尾的显式分支，且现在会留痕。
+ */
+const SCENARIO_ALIASES = {
+  // 碎刀 / 强化失败
+  equip_broken: 'equip_broken', broken: 'equip_broken', upgrade_broken: 'equip_broken',
+  reinforce_fail: 'equip_broken', upgrade_fail: 'equip_broken', pad_weapon: 'equip_broken',
+  catalyst: 'equip_broken',
+  // 日常离线关怀
+  offline_care: 'offline_care', offline: 'offline_care', goodnight: 'offline_care',
+  care: 'offline_care', daily: 'offline_care', greeting: 'offline_care',
+  dungeon_assist: 'offline_care', cube_reimburse: 'offline_care',
+  // 深渊光头
+  abyss_blank: 'abyss_blank', abyss: 'abyss_blank', bald_head: 'abyss_blank',
+  epic_fail: 'abyss_blank', invitation: 'abyss_blank',
+  // ── v3 新增三情境（含中文/常见别名）──
+  reunion: 'reunion', return: 'reunion', come_back: 'reunion', long_absence: 'reunion',
+  重逢: 'reunion', 回归: 'reunion', 久别: 'reunion', 好久不见: 'reunion',
+  anniversary: 'anniversary', anniversary_day: 'anniversary', memorial: 'anniversary',
+  周年: 'anniversary', 纪念日: 'anniversary', 相识纪念: 'anniversary',
+  after_quarrel: 'after_quarrel', quarrel: 'after_quarrel', make_up: 'after_quarrel',
+  reconcile: 'after_quarrel', reconciliation: 'after_quarrel',
+  吵架: 'after_quarrel', 冷战: 'after_quarrel', 和好: 'after_quarrel', 道歉: 'after_quarrel',
+};
+
+/** 规范情境集合（供 fail-loud 判定；从 MAIL_SCENARIOS 派生，新增情境自动跟上）。 */
+const KNOWN_MAIL_SCENARIOS = new Set(Object.values(MAIL_SCENARIOS));
+
+// ── 3.1 情境解析的可观测计数（fail-loud 的"计数"半边） ────────────────────────
+const _mailScenarioStats = { resolved: 0, unknown: 0, hintFallback: 0, clamped: 0, lastWarning: null };
+const _unknownScenarioSeen = new Map();   // 收到的原值 -> 次数
+
+/** 只读观测口：情境解析计数（供门禁/运维断言）。 */
+export function getMailScenarioStats() {
+  return { ..._mailScenarioStats, unknownValues: Object.fromEntries(_unknownScenarioSeen) };
+}
+
+/** 测试用：清零计数（含最近一条告警原文）。 */
+export function resetMailScenarioStats() {
+  _mailScenarioStats.resolved = 0;
+  _mailScenarioStats.unknown = 0;
+  _mailScenarioStats.hintFallback = 0;
+  _mailScenarioStats.clamped = 0;
+  _mailScenarioStats.lastWarning = null;
+  _unknownScenarioSeen.clear();
+}
+
+// ── 3.2 邮件通道三约束的唯一执行点（t29） ─────────────────────────────────────
+// 定调 §10.5 / 硬红线 B 类：标题 ≤30B、正文 ≤360B、Subject+'\n'+Body < 512B
+// （越界 → 客户端开信箱报错误 17）。旧实现里 `title.slice(0,16)` 最多可到 32B、
+// 正文完全无校验、且**没有任何度量**——属"静默超界"。这里补上确定性执行 + 可见截断。
+const MAIL_TITLE_MAX_BYTES = 30;
+const MAIL_BODY_MAX_BYTES = 360;
+const MAIL_TOTAL_MAX_BYTES = 512;
+
+/** GBK 字节长度：ASCII 1B，其余 2B（与 Go 侧 `SanitizeLoverReply` 同口径）。 */
+export function gbkByteLength(text) {
+  let n = 0;
+  for (const ch of String(text ?? '')) n += ch.codePointAt(0) <= 0x7f ? 1 : 2;
+  return n;
+}
+
+/** 按 GBK 字节预算截断（不切碎多字节字符）。 */
+export function truncateToGbkBytes(text, maxBytes) {
+  let out = '';
+  let n = 0;
+  for (const ch of String(text ?? '')) {
+    const w = ch.codePointAt(0) <= 0x7f ? 1 : 2;
+    if (n + w > maxBytes) break;
+    out += ch;
+    n += w;
+  }
+  return out;
+}
+
+/**
+ * 把一封邮件收进通道预算内，并**留下可观测痕迹**（WARN + 计数 + 返回值里的实测字节）。
+ * 返回 `{ title, body, title_bytes, body_bytes, total_bytes, clamped }`。
+ */
+export function enforceMailChannelLimits({ title, body } = {}) {
+  const t0 = String(title ?? '');
+  const b0 = String(body ?? '');
+  const titleOut = truncateToGbkBytes(t0, MAIL_TITLE_MAX_BYTES);
+  let bodyOut = truncateToGbkBytes(b0, MAIL_BODY_MAX_BYTES);
+  const titleBytes = gbkByteLength(titleOut);
+  if (titleBytes + 1 + gbkByteLength(bodyOut) >= MAIL_TOTAL_MAX_BYTES) {
+    bodyOut = truncateToGbkBytes(bodyOut, Math.max(0, MAIL_TOTAL_MAX_BYTES - 2 - titleBytes));
+  }
+  const bodyBytes = gbkByteLength(bodyOut);
+  const clamped = titleOut !== t0 || bodyOut !== b0;
+  if (clamped) {
+    _mailScenarioStats.clamped += 1;
+    const msg = `[Game] 邮件超通道预算已可见截断：title ${gbkByteLength(t0)}B→${titleBytes}B / ` +
+      `body ${gbkByteLength(b0)}B→${bodyBytes}B（上限 30/360，合计硬边界 <512B）`;
+    _mailScenarioStats.lastWarning = msg;
+    log('warn', msg);
+  }
+  return {
+    title: titleOut,
+    body: bodyOut,
+    title_bytes: titleBytes,
+    body_bytes: bodyBytes,
+    total_bytes: titleBytes + 1 + bodyBytes,
+    clamped
+  };
+}
+
+/** 只读窥探：语料里实际注册了哪些 scenario（供"代码表 vs 语料"一致性门禁）。 */
+export function getRegisteredScenarioIds() {
+  return { known: [...KNOWN_MAIL_SCENARIOS].sort(), aliases: Object.keys(SCENARIO_ALIASES).sort() };
+}
+
+/**
+ * 未知情境留痕：WARN（含收到的原值）+ 计数。
+ * 这是 T-7 要求的 fail-loud 实现——**绝不静默落默认**。
+ */
+function reportUnknownScenario(received) {
+  const raw = String(received ?? '');
+  _mailScenarioStats.unknown += 1;
+  _unknownScenarioSeen.set(raw, (_unknownScenarioSeen.get(raw) || 0) + 1);
+  const msg = `[Game] 邮件情境未注册 scenario="${raw}" → 已降级为 offline_care 兜底（可见降级，非静默）。` +
+    `请在 MAIL_SCENARIOS + SCENARIO_ALIASES + selectMailGift 三处注册（定调 §18 T-7）`;
+  _mailScenarioStats.lastWarning = msg;
+  log('warn', msg);
+}
+
 
 export const DNF_LEGIT_MAIL_GIFTS = [
   {
@@ -510,59 +660,195 @@ export function getMailGiftList() {
 }
 
 /**
- * 解析触发情境（情境状态机），废除盲抽，杜绝无情境乱发高强装备
+ * 解析触发情境（情境状态机），废除盲抽，杜绝无情境乱发高强装备。
+ *
+ * **T-7 改动要点（定调 §18）**：语料 v3 新增 `reunion / anniversary / after_quarrel`
+ * 三情境已注册。**同时把"未知情境"从静默落默认改为 fail-loud**：
+ *   · 调用方**明确给了** `scenario`/`eventType` 而无法识别 → WARN（含收到的原值）+ 计数，
+ *     并返回哨兵 `MAIL_SCENARIO_UNKNOWN`（由 `selectMailGift` 走安全兜底 +
+ *     `/game/mail` 响应带 `scenario_degraded:true`，**降级可见**）；
+ *   · 调用方**压根没给**情境（无 scenario/eventType，也没命中 hint/targetItemId）→
+ *     仍回落 `offline_care`，但计入 `hintFallback`（这是产品意义上的正常默认，不是异常）。
+ * 两者的区别：前者是"说了一个我不认识的情境"（缺陷），后者是"没说"（正常）。
+ *
+ * @returns {string} MAIL_SCENARIOS.* 之一，或 MAIL_SCENARIO_UNKNOWN（唯一降级态）
  */
 export function resolveMailScenario({ scenario, eventType, hint, targetItemId } = {}) {
   const explicit = String(scenario || eventType || '').trim().toLowerCase();
   if (explicit) {
-    if (['equip_broken', 'broken', 'upgrade_broken', 'reinforce_fail', 'upgrade_fail', 'pad_weapon', 'catalyst'].includes(explicit)) {
-      return MAIL_SCENARIOS.EQUIP_BROKEN;
+    const mapped = SCENARIO_ALIASES[explicit];
+    if (mapped) {
+      _mailScenarioStats.resolved += 1;
+      return mapped;
     }
-    if (['offline_care', 'offline', 'goodnight', 'care', 'daily', 'greeting', 'dungeon_assist', 'cube_reimburse'].includes(explicit)) {
-      return MAIL_SCENARIOS.OFFLINE_CARE;
-    }
-    if (['abyss_blank', 'abyss', 'bald_head', 'epic_fail', 'invitation'].includes(explicit)) {
-      return MAIL_SCENARIOS.ABYSS_BLANK;
-    }
-    return explicit;
+    // 明确给了值但不认识 → fail-loud（这就是 T-7 要消灭的静默分支）
+    reportUnknownScenario(explicit);
+    return MAIL_SCENARIO_UNKNOWN;
   }
 
   const h = String(hint || '').toLowerCase();
   if (/碎|强化|垫刀|垫子|凯丽|炸了|失败|炉岩|碳|武士刀/.test(h)) {
+    _mailScenarioStats.resolved += 1;
     return MAIL_SCENARIOS.EQUIP_BROKEN;
   }
   if (/深渊|光头|邀请函|门票|史诗|闪光|空手|恶魔邀请函/.test(h)) {
+    _mailScenarioStats.resolved += 1;
     return MAIL_SCENARIOS.ABYSS_BLANK;
   }
+  // ── v3 新增三情境的 hint 识别（放在 offline_care 的宽泛词之前，避免被"泉水/圣经"吃掉）──
+  if (/重逢|回归|好久不见|久别|你回来了|一个礼拜|两周没|半个月没/.test(h)) {
+    _mailScenarioStats.resolved += 1;
+    return MAIL_SCENARIOS.REUNION;
+  }
+  if (/周年|纪念日|相识纪念|在一起.*(天|年)|第.*周年/.test(h)) {
+    _mailScenarioStats.resolved += 1;
+    return MAIL_SCENARIOS.ANNIVERSARY;
+  }
+  if (/吵架|冷战|和好|道歉|不理我|生气了|闹别扭|台阶/.test(h)) {
+    _mailScenarioStats.resolved += 1;
+    return MAIL_SCENARIOS.AFTER_QUARREL;
+  }
   if (/晚安|下线|熄灯|睡觉|日常|泉水|回血|补给|圣经|回避|无色|大招|关电脑|拉闸/.test(h)) {
+    _mailScenarioStats.resolved += 1;
     return MAIL_SCENARIOS.OFFLINE_CARE;
   }
 
   // 检查显式请求的 targetItemId 语义
   if (targetItemId === 27600 || targetItemId === 3171 || targetItemId === 11 || targetItemId === 12) {
+    _mailScenarioStats.resolved += 1;
     return MAIL_SCENARIOS.EQUIP_BROKEN;
   }
   if (targetItemId === 3214) {
+    _mailScenarioStats.resolved += 1;
     return MAIL_SCENARIOS.ABYSS_BLANK;
   }
   if (targetItemId === 1048 || targetItemId === 1070 || targetItemId === 3174) {
+    _mailScenarioStats.resolved += 1;
     return MAIL_SCENARIOS.OFFLINE_CARE;
   }
 
-  // 兜底安全策略：无明确情境时归入日常离线关怀，杜绝乱发高强装备
+  // 兜底安全策略：调用方**没给**任何情境线索 → 归入日常离线关怀（杜绝乱发高强装备）。
+  // 注意：这是"没说"，不是"说了个不认识的"，故不 fail-loud，只计 hintFallback 供观察。
+  _mailScenarioStats.hintFallback += 1;
   return MAIL_SCENARIOS.OFFLINE_CARE;
 }
 
 /**
- * 依据情境状态机选取专属礼物，废除 Math.random 盲抽
+ * 依据情境状态机选取专属礼物，废除 Math.random 盲抽。
+ *
+ * v3 三情境的附件策略**只从既有白名单里挑**（不新增道具 ID）：
+ *   · `reunion`       → 天空之城泉水 1048（`recovery`）：久别归来的补给，与 v3 语料 5/5 条一致
+ *   · `anniversary`   → 无色小晶块 3174（`cube`）优先，退化到 1048：纪念日给"能马上用掉"的
+ *   · `after_quarrel` → 蓝色圣经 1070（`special`）优先，退化到 1048：台阶/保命，与语料一致
+ * 三者的**兜底方向都朝"安全日常消耗品"**（绝不落 pad_weapon），与既有 offline_care 同向。
+ * `targetItemId` 显式指定仍然最优先（调用方说了算）。
+ *
+ * @returns {object} 礼物条目（含 item_id/name/count/upgrade_level/category/scenario/dialogue）
  */
 export function selectMailGift({ scenario, hint = '', targetItemId = 0, targetUpgradeLevel = null } = {}) {
   const allGifts = getMailGiftList();
   const h = String(hint || '').toLowerCase();
 
-  // 兼容逻辑：如果 attach_item_id 传了 11/12，转换为武士刀 27600 对应强化等级
+  // 显式 ID 命中最优先：调用方点明要什么就给什么（既有的兼容语义，不改）
+  const explicitHit = _findExplicitGift(allGifts, targetItemId, targetUpgradeLevel, h);
+  if (explicitHit) return explicitHit;
+
+  const pick = (...preds) => {
+    for (const p of preds) {
+      const hit = allGifts.find(p);
+      if (hit) return hit;
+    }
+    return null;
+  };
+  const byCategory = (cat) => (g) => g.category === cat;
+  const byItem = (id) => (g) => g.item_id === id;
+
+  // 状态机场景路由（严禁 Math.random 盲抽）
+  switch (scenario) {
+    case MAIL_SCENARIOS.EQUIP_BROKEN: {
+      // 碎刀送垫刀/碳
+      if (/碳|炉岩/.test(h)) {
+        return pick(byCategory('catalyst'), byItem(3171), byCategory('pad_weapon'));
+      }
+      if (/12|十二|万仞|极品/.test(h)) {
+        return pick((g) => g.category === 'pad_weapon' && g.upgrade_level === 12, byCategory('pad_weapon'));
+      }
+      // 默认碎刀送 +11 垫刀
+      return pick(
+        (g) => g.category === 'pad_weapon' && g.upgrade_level === 11,
+        byCategory('pad_weapon'),
+        byItem(3171),
+      );
+    }
+
+    case MAIL_SCENARIOS.ABYSS_BLANK: {
+      // 深渊光头/空手送深渊票；无票时退化到安全日常（绝不落武器）
+      return pick(byCategory('abyss_ticket'), byItem(3214), byCategory('recovery'));
+    }
+
+    // ── v3 新增三情境：各自的附件策略（全部落在既有白名单内）──
+    case MAIL_SCENARIOS.REUNION: {
+      // 久别归来：给补给（泉水），照 hint 可换圣经/晶块
+      if (/圣经|回避|保命/.test(h)) return pick(byCategory('special'), byItem(1070), byCategory('recovery'));
+      if (/无色|晶块|大招/.test(h)) return pick(byCategory('cube'), byItem(3174), byCategory('recovery'));
+      return pick(byCategory('recovery'), byItem(1048), byCategory('cube'));
+    }
+
+    case MAIL_SCENARIOS.ANNIVERSARY: {
+      // 纪念日：给"能马上用掉"的晶块；hint 可换圣经/泉水
+      if (/圣经|保命|回避/.test(h)) return pick(byCategory('special'), byItem(1070), byCategory('cube'));
+      if (/泉水|回血|补给/.test(h)) return pick(byCategory('recovery'), byItem(1048), byCategory('cube'));
+      return pick(byCategory('cube'), byItem(3174), byCategory('recovery'));
+    }
+
+    case MAIL_SCENARIOS.AFTER_QUARREL: {
+      // 摩擦后和解：给台阶（圣经=保命/回避，语义贴"护着你"）；hint 可换泉水
+      if (/泉水|回血|补给/.test(h)) return pick(byCategory('recovery'), byItem(1048), byCategory('special'));
+      return pick(byCategory('special'), byItem(1070), byCategory('recovery'), byCategory('cube'));
+    }
+
+    case MAIL_SCENARIO_UNKNOWN: {
+      // fail-loud 的消费侧：resolveMailScenario 已经打过 WARN 并计数，
+      // 这里只做"安全兜底"，绝不放高强武器。降级可见性由 /game/mail 的
+      // scenario_degraded 标记承载（见 handler）。
+      return pick(byCategory('recovery'), byCategory('cube'), byCategory('special'), byCategory('abyss_ticket'))
+        || safeNonWeapon(allGifts);
+    }
+
+    case MAIL_SCENARIOS.OFFLINE_CARE:
+    default: {
+      // 晚安送水/日常补给，杜绝高强武器；default 分支同样守住"不落武器"
+      if (/圣经|回避|保命|无头/.test(h)) {
+        return pick(byCategory('special'), byItem(1070), byCategory('recovery')) || safeNonWeapon(allGifts);
+      }
+      if (/无色|大招|晶块|报销/.test(h)) {
+        return pick(byCategory('cube'), byItem(3174), byCategory('recovery')) || safeNonWeapon(allGifts);
+      }
+      // 默认送天空之城泉水
+      return pick(byCategory('recovery'), byItem(1048)) || safeNonWeapon(allGifts);
+    }
+  }
+}
+
+/**
+ * 最后一个安全网：**永不返回高强武器**（pad_weapon / upgrade_level>0）。
+ * 只在语料被换成一个不含任何消耗品的异常集合时才会用到；即便那时，
+ * 也优先给非武器条目，最后才退到 allGifts[0]（避免"无礼物可寄"导致上游 500）。
+ */
+function safeNonWeapon(allGifts) {
+  return allGifts.find((g) => g.category !== 'pad_weapon' && (g.upgrade_level || 0) === 0)
+    || allGifts.find((g) => g.category !== 'pad_weapon')
+    || allGifts[0];
+}
+
+/**
+ * 显式 `attach_item_id` 命中（含 11/12 → 武士刀 27600 的既有兼容转换）。
+ * 抽出来只为让 `selectMailGift` 的主干更短；**语义与 v1 完全一致**，不改行为。
+ */
+function _findExplicitGift(allGifts, targetItemId, targetUpgradeLevel, h) {
   let normalizedItemId = Number(targetItemId || 0);
-  let normalizedUpgradeLevel = targetUpgradeLevel !== null && targetUpgradeLevel !== undefined ? Number(targetUpgradeLevel) : null;
+  let normalizedUpgradeLevel = targetUpgradeLevel !== null && targetUpgradeLevel !== undefined
+    ? Number(targetUpgradeLevel) : null;
   if (normalizedItemId === 11) {
     normalizedItemId = 27600;
     if (normalizedUpgradeLevel === null) normalizedUpgradeLevel = 11;
@@ -570,69 +856,19 @@ export function selectMailGift({ scenario, hint = '', targetItemId = 0, targetUp
     normalizedItemId = 27600;
     if (normalizedUpgradeLevel === null) normalizedUpgradeLevel = 12;
   }
+  if (!(normalizedItemId > 0)) return null;
 
-  // 1. 若显式指定 targetItemId，精确命中
-  if (normalizedItemId > 0) {
-    const matched = allGifts.filter(g => g.item_id === normalizedItemId);
-    if (matched.length > 0) {
-      if (normalizedUpgradeLevel !== null) {
-        const exact = matched.find(g => (g.upgrade_level || 0) === normalizedUpgradeLevel);
-        if (exact) return exact;
-      }
-      if (/12|十二/.test(h)) {
-        const plus12 = matched.find(g => (g.upgrade_level || 0) === 12);
-        if (plus12) return plus12;
-      }
-      return matched[0];
-    }
+  const matched = allGifts.filter(g => g.item_id === normalizedItemId);
+  if (matched.length === 0) return null;
+  if (normalizedUpgradeLevel !== null) {
+    const exact = matched.find(g => (g.upgrade_level || 0) === normalizedUpgradeLevel);
+    if (exact) return exact;
   }
-
-  // 2. 状态机场景路由（严禁 Math.random 盲抽）
-  switch (scenario) {
-    case MAIL_SCENARIOS.EQUIP_BROKEN: {
-      // 碎刀送垫刀/碳
-      if (/碳|炉岩/.test(h)) {
-        return allGifts.find(g => g.category === 'catalyst' || g.item_id === 3171)
-          || allGifts.find(g => g.category === 'pad_weapon');
-      }
-      if (/12|十二|万仞|极品/.test(h)) {
-        return allGifts.find(g => g.category === 'pad_weapon' && g.upgrade_level === 12)
-          || allGifts.find(g => g.category === 'pad_weapon');
-      }
-      // 默认碎刀送 +11 垫刀
-      return allGifts.find(g => g.category === 'pad_weapon' && g.upgrade_level === 11)
-        || allGifts.find(g => g.category === 'pad_weapon')
-        || allGifts.find(g => g.item_id === 3171);
-    }
-
-    case MAIL_SCENARIOS.ABYSS_BLANK: {
-      // 深渊光头/空手送深渊票
-      const ticket = allGifts.find(g => g.category === 'abyss_ticket' || g.item_id === 3214);
-      if (ticket) return ticket;
-      break;
-    }
-
-    case MAIL_SCENARIOS.OFFLINE_CARE:
-    default: {
-      // 晚安送水/日常补给，杜绝高强武器
-      if (/圣经|回避|保命|无头/.test(h)) {
-        const bible = allGifts.find(g => g.category === 'special' || g.item_id === 1070);
-        if (bible) return bible;
-      }
-      if (/无色|大招|晶块|报销/.test(h)) {
-        const cube = allGifts.find(g => g.category === 'cube' || g.item_id === 3174);
-        if (cube) return cube;
-      }
-      // 默认送天空之城泉水
-      const water = allGifts.find(g => g.category === 'recovery' || g.item_id === 1048);
-      if (water) return water;
-      const safeDaily = allGifts.find(g => g.category !== 'pad_weapon' && (g.upgrade_level || 0) === 0);
-      if (safeDaily) return safeDaily;
-    }
+  if (/12|十二/.test(h)) {
+    const plus12 = matched.find(g => (g.upgrade_level || 0) === 12);
+    if (plus12) return plus12;
   }
-
-  // 安全保底：天空之城泉水
-  return allGifts.find(g => g.item_id === 1048) || allGifts[0];
+  return matched[0];
 }
 
 // ── 2.2 方案B：拟人化打字机动量与短句切分器（Sentence Burst Chunker） ────────
@@ -764,6 +1000,13 @@ gameRouter.post('/game/chat', async (req, res) => {
     onlineResult = null;
   }
 
+  // [t13] 临时探针（验证用，验证结束后删除）
+  log('warn', '[t13probe] onlineResult=' + (onlineResult === null ? 'null' : (onlineResult === undefined ? 'undefined' : 'obj'))
+      + ' reply=' + JSON.stringify(String((onlineResult && onlineResult.reply) || '').slice(0, 40))
+      + ' sleeping=' + String(onlineResult && onlineResult.sleeping)
+      + ' apiFailed=' + String(onlineResult && onlineResult.apiFailed)
+      + ' sinkFailed=' + String(!!failureSink.failed) + ' sinkReason=' + JSON.stringify(failureSink.reason || ''));
+
   // 2. 在线分支返回（经方案B断句切分）
   if (onlineResult && onlineResult.reply) {
     // 睡眠态单独成值：她没生成内容，只是"睡了"，不是失败也不是本地语料
@@ -846,11 +1089,16 @@ gameRouter.post('/game/mail', async (req, res) => {
   if (!c) return res.status(404).json({ ok: false, error: `恋人 NPC 不存在: ${npc}` });
 
   // 1. 解析情境与选取专属礼物（废除 Math.random 盲抽，绑定情境状态机）
+  const scenarioInputRaw = String(scenarioInput ?? '').trim();
   const scenario = resolveMailScenario({
     scenario: scenarioInput,
     hint,
     targetItemId
   });
+  // T-7：未知情境的**可见降级**标记（日志+计数在 resolveMailScenario 内已完成）。
+  // 未给情境（正常默认）不标降级，避免把"没说"误报成"说错了"。
+  const scenarioDegraded = scenario === MAIL_SCENARIO_UNKNOWN;
+  const scenarioOut = scenarioDegraded ? MAIL_SCENARIOS.OFFLINE_CARE : scenario;
 
   const gift = selectMailGift({
     scenario,
@@ -922,12 +1170,31 @@ gameRouter.post('/game/mail', async (req, res) => {
     };
   }
 
+  // 3.1（t29）邮件通道三约束的**唯一执行点**：标题 ≤30B / 正文 ≤360B /
+  // Subject+'\n'+Body < 512B。超界会**可见截断**（WARN + getMailScenarioStats().clamped），
+  // 并把实测字节回给 Go 侧（不再像旧实现那样 `slice(0,16)` 静默超界且无度量）。
+  const mailBytes = enforceMailChannelLimits({ title: mailResult.title, body: mailResult.body });
+  mailResult = { title: mailBytes.title, body: mailBytes.body };
+
   return res.json({
     ok: true,
     npc: c.name,
-    scenario,
+    // 契约：scenario 始终是**可消费的规范值**（未知时已归一为 offline_care 兜底），
+    // 便于 Go 侧直接用它做后续判定而不必理解哨兵。
+    scenario: scenarioOut,
+    // T-7 可见降级三件套：收到什么 / 是否降级 / 为什么——响应里必须能看出来
+    scenario_input: scenarioInputRaw || null,
+    scenario_degraded: scenarioDegraded,
+    ...(scenarioDegraded ? { scenario_degraded_reason: 'unknown_scenario_not_registered' } : {}),
     title: mailResult.title,
     body: mailResult.body,
+    // t29：通道字节实测（GBK），供 Go 侧与门禁断言直接消费
+    mail_bytes: {
+      title_bytes: mailBytes.title_bytes,
+      body_bytes: mailBytes.body_bytes,
+      total_bytes: mailBytes.total_bytes,
+      clamped: mailBytes.clamped,
+    },
     attachment: {
       item_id: gift.item_id,
       item_name: gift.name,

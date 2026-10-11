@@ -461,7 +461,195 @@ export function resetMailScenarioStats() {
   _unknownScenarioSeen.clear();
 }
 
-// ── 3.2 邮件通道三约束的唯一执行点（t29） ─────────────────────────────────────
+// ── 3.3 称呼变量注入与 fail-loud 守卫（定调 §18 T-10） ────────────────────────
+/**
+ * 称呼占位符的**冻结写法**（单花括号）：`{player_nickname}` 玩家昵称、`{player_alias}` 她的外号。
+ *
+ * 为什么必须有这一层：语料 v3 里已出现这两个变量，而运行期**原本没有任何替换逻辑**——
+ * 本地语料出话会把 `{player_nickname}` **原样发给玩家**（比年代穿帮严重得多）。
+ * 本层保证"即使语料里还有占位符也不会漏给玩家"，并把无法解析的情况变成**可见告警**。
+ *
+ * 兼容与幂等（T-10 的 ④）：历史上出现过双花括号 `{{player_nickname}}`（归一前旧稿），
+ * 这里**同时认两种写法**并归一为单花括号输出；转换是"模式级"的（不是把 `{{`→`{` 全局替换），
+ * 因此**重复执行结果稳定**，不会出现二次变形。
+ */
+export const CALL_NAME_CHANNELS = {
+  CHAT: 'chat',
+  MAIL_TITLE: 'mail_title',
+  MAIL_BODY: 'mail_body',
+  WHITE: 'white',    // 近身白字——当前由 Go 侧装配，大脑无出口；此处预留，避免下游重新发明
+  YELLOW: 'yellow',  // 全服黄字——同上
+};
+const KNOWN_CALL_CHANNELS = new Set(Object.values(CALL_NAME_CHANNELS));
+
+// 兜底用"你"：与 `companions.call_user_as` 的 DB 默认值一致（db.mjs:1065），
+// 也是定调 §18 T-10 明确点名的降级目标。
+const CALL_NICKNAME_FALLBACK = '你';
+
+// ── 可观测计数（fail-loud 的"计数"半边）──
+const _callNameStats = {
+  injected: 0,        // 发生过替换的文本数
+  tokenCount: 0,      // 累计替换的 token 数
+  legacyBraces: 0,    // 遇到双花括号旧稿的次数
+  residual: 0,        // 兜底修复的残留占位符数（>0 即说明语料有写错的变量名）
+  unknownChannel: 0,
+  lastWarning: null,
+};
+
+/** 只读观测口：称呼注入计数（供门禁/运维断言）。 */
+export function getCallNameStats() { return { ..._callNameStats }; }
+/** 测试用：清零称呼注入计数。 */
+export function resetCallNameStats() {
+  for (const k of Object.keys(_callNameStats)) {
+    _callNameStats[k] = (k === 'lastWarning') ? null : 0;
+  }
+}
+
+/**
+ * 解析"她该怎么叫玩家"。
+ * 优先级**逐字对齐基座 §5.1（line 688-692）冻结链**：
+ *   `companion_shaping.nickname` → `companions.player_nickname` → **人设 T1 默认叫法** → 「你」
+ * 其中 **"人设 T1 默认叫法"的落地字段就是 `companions.call_user_as`**——基座 §5.1 的
+ * 伪代码在"人设 T1 默认叫法"下方明确标注 `（call_user_as）`，且 §5.1 的消费点写着
+ * `call_user_as` → `companion.mjs:402`。故本函数的第 3 档读它，不是另立一个字段。
+ *
+ * `{player_alias}`（她给的外号）走 `companions.exonym`（**列尚未迁移**，存在性检测），
+ * 缺失即回落昵称→「你」。**注意**：不回落到 `call_user_as` 的"你"以外值，
+ * 以免把"昵称"当"外号"用（两者语义不同，见 T-10 对两个变量的定义）。
+ *
+ * 尚未迁移的列（`player_nickname` / `exonym`）靠"存在性检测"处理：列不存在 → undefined
+ * → 自动跳过该档，**不抛、不报错**，等迁移落地后无需再改本函数。
+ */
+export function resolveCallNames(companion) {
+  const c = companion || {};
+  let shapingNickname = '';
+  try {
+    const row = getDb().prepare(
+      `SELECT content FROM companion_shaping WHERE companion_id = ? AND kind = 'nickname' ` +
+      `ORDER BY created_at DESC, id DESC LIMIT 1`,
+    ).get(c.id);
+    shapingNickname = String(row?.content || '').trim();
+  } catch { /* 表缺失 / id 为空 / DB 未就绪 → 静默跳过这一档（后面还有 3 档兜底） */ }
+
+  const mirrorNickname = String(c.player_nickname ?? '').trim();   // 列可能不存在 → undefined
+  const callUserAs = String(c.call_user_as ?? '').trim();
+  const aliasColumn = String(c.exonym ?? '').trim();               // 列可能不存在
+
+  const nickname = shapingNickname || mirrorNickname
+    || (callUserAs && callUserAs !== '你' ? callUserAs : '')
+    || CALL_NICKNAME_FALLBACK;
+  const alias = aliasColumn || nickname;
+
+  return {
+    nickname,
+    alias,
+    source: shapingNickname ? 'shaping'
+      : mirrorNickname ? 'player_nickname'
+        : (callUserAs && callUserAs !== '你') ? 'call_user_as' : 'fallback',
+  };
+}
+
+function _looksLikeUnresolvedBrace(text) {
+  return /\{\{?[^}]{0,40}\}?\}/.test(String(text ?? ''));
+}
+
+/** 兜底替换用的"像占位符"模式：`{任意短Token}`。用于把写错的变量名也修掉。 */
+const CALL_RESIDUAL_RE = /\{\{?[^}]{0,40}\}?\}/g;
+
+/**
+ * 出话前的**唯一**称呼注入点。所有发给玩家的文本都必须过这里。
+ *
+ * 行为：
+ *   ① 归一：把旧的 `{{player_nickname}}` 双花括号写法按**模式**转成单花括号（幂等，不二次变形）；
+ *   ② 替换：`{player_nickname}` → 昵称、`{player_alias}` → 外号；
+ *   ③ fail-loud：装配后若仍残留未解析占位符 → WARN（含 NPC/通道/原文片段）+ 计数，
+ *      并**就地兜底修掉**（降级为「你」），**绝不把占位符原样发给玩家**。
+ *
+ * @param {string} text
+ * @param {object} companion companion 行（可为 null → 全部走兜底）
+ * @param {{channel?: string}} [opts]
+ * @returns {{text: string, injected: number, legacyBraces: number, residual: number, changed: boolean}}
+ */
+export function injectCallNames(text, companion, { channel = CALL_NAME_CHANNELS.CHAT } = {}) {
+  const original = String(text ?? '');
+  if (!original) return { text: original, injected: 0, legacyBraces: 0, residual: 0, changed: false };
+
+  const ch = KNOWN_CALL_CHANNELS.has(channel) ? channel : CALL_NAME_CHANNELS.CHAT;
+  if (ch !== channel) _callNameStats.unknownChannel += 1;   // 未知通道不阻断，按 chat 记账
+
+  const { nickname, alias } = resolveCallNames(companion);
+  const npc = String(companion?.name || '?');
+
+  let out = original;
+  let injected = 0;
+  let legacyBraces = 0;
+
+  // ① 归一 + 替换（一次正则同时认单/双花括号；`{{x}}` 的 `{` 会被 `\{\{?` 吃掉，剩 `}` 由收尾清）
+  out = out.replace(/\{\{?\s*(player_nickname|player_alias)\s*\}?\}/gi, (m, varName) => {
+    injected += 1;
+    if (m.includes('{{')) legacyBraces += 1;
+    const key = String(varName).toLowerCase();
+    return key === 'player_nickname' ? nickname : alias;
+  });
+  if (legacyBraces > 0) {
+    _callNameStats.legacyBraces += legacyBraces;
+    const w = `[Game] 称呼变量旧稿（双花括号）已归一为单花括号：npc=${npc} channel=${ch} 命中 ${legacyBraces} 处`;
+    _callNameStats.lastWarning = w;
+    log('warn', w);
+  }
+
+  // ② fail-loud：残留未解析占位符（变量名写错 / 大小写变体 / 半个括号）→ 告警并兜底。
+  //    判据刻意放宽为"任何 `{短Token}`"：`{player_nicknames}` 这类**写错的变量名**
+  //    同样会把花括号原文漏给玩家（探针实测过），只认 nickname|alias 会漏掉它们。
+  let residual = 0;
+  if (_looksLikeUnresolvedBrace(out)) {
+    const before = out;
+    const hits = before.match(CALL_RESIDUAL_RE) || [];
+    out = out.replace(CALL_RESIDUAL_RE, CALL_NICKNAME_FALLBACK);
+    residual = hits.length;
+    _callNameStats.residual += residual;
+    const snippet = String(before).slice(0, 60).replace(/\s+/g, ' ');
+    const w = `[Game] 称呼变量未能解析已就地兜底（禁止占位符漏给玩家）：npc=${npc} channel=${ch} ` +
+      `兜底=${CALL_NICKNAME_FALLBACK} 残留=${residual} 命中=${JSON.stringify(hits.slice(0, 3))} 原文片段="${snippet}"`;
+    _callNameStats.lastWarning = w;
+    log('warn', w);
+  } else if (out.includes('{{')) {
+    // 落单的 `{{`（不构成任何占位符，但 T-10 明确要求扫它）：同样必须可见并归一，
+    // 防止"半个括号"这种残骸被玩家看到。只把 `{{` 收成 `{`，不动其它内容。
+    _callNameStats.residual += 1;
+    residual += 1;
+    out = out.replace(/\{\{/g, '{');
+    const w = `[Game] 文本含落单双花括号已归一为单花括号：npc=${npc} channel=${ch} ` +
+      `原文片段="${String(original).slice(0, 60)}"`;
+    _callNameStats.lastWarning = w;
+    log('warn', w);
+  }
+
+  if (injected > 0) {
+    _callNameStats.injected += 1;
+    _callNameStats.tokenCount += injected;
+  }
+  return { text: out, injected, legacyBraces, residual, changed: out !== original };
+}
+
+/**
+ * 校验任意出站文本**不含**称呼占位符（供门禁做"最后一道门"断言）。
+ * @returns {{ok: boolean, hits: string[]}}
+ */
+export function assertNoCallPlaceholders(text) {
+  const hits = String(text ?? '').match(/\{\{?\s*player_(nickname|alias)\s*\}?\}/gi) || [];
+  return { ok: hits.length === 0, hits };
+}
+
+/**
+ * 私聊文本装配的**单一入口**：先注入称呼，再切句成 burst。
+ * 三条私聊出口（问候短路 / 在线成功 / 在线失败后本地兜底）全部走它，避免漏点。
+ */
+function buildChatBurst(rawText, companion, channel = CALL_NAME_CHANNELS.CHAT) {
+  return chunkToBursts(injectCallNames(rawText, companion, { channel }).text);
+}
+
+// ── 3.4 邮件通道三约束的唯一执行点（t29） ─────────────────────────────────────
 // 定调 §10.5 / 硬红线 B 类：标题 ≤30B、正文 ≤360B、Subject+'\n'+Body < 512B
 // （越界 → 客户端开信箱报错误 17）。旧实现里 `title.slice(0,16)` 最多可到 32B、
 // 正文完全无校验、且**没有任何度量**——属"静默超界"。这里补上确定性执行 + 可见截断。
@@ -960,7 +1148,8 @@ gameRouter.post('/game/chat', async (req, res) => {
   // 如果纯属主动问候事件（!text && eventType === 'greeting'），直接由洗牌袋出高质量非 AI 感语料
   if (!text && eventType === 'greeting') {
     const reply = getLocalGamerGirlReply(c, '', 'greeting');
-    const burst = chunkToBursts(reply);
+    // T-10：问候短路的正文同样过称呼注入（问候池是最常带称呼的一批语料）
+    const burst = buildChatBurst(reply, c, CALL_NAME_CHANNELS.CHAT);
     return res.json({
       ok: true,
       npc: c.name,
@@ -1000,14 +1189,6 @@ gameRouter.post('/game/chat', async (req, res) => {
     onlineResult = null;
   }
 
-  // [t13] 临时探针（验证用，验证结束后删除）
-  log('warn', '[t13probe] onlineResult=' + (onlineResult === null ? 'null' : (onlineResult === undefined ? 'undefined' : 'obj'))
-      + ' reply=' + JSON.stringify(String((onlineResult && onlineResult.reply) || '').slice(0, 40))
-      + ' sleeping=' + String(onlineResult && onlineResult.sleeping)
-      + ' apiFailed=' + String(onlineResult && onlineResult.apiFailed)
-      + ' sinkFailed=' + String(!!failureSink.failed) + ' sinkReason=' + JSON.stringify(failureSink.reason || ''));
-
-  // 2. 在线分支返回（经方案B断句切分）
   if (onlineResult && onlineResult.reply) {
     // 睡眠态单独成值：她没生成内容，只是"睡了"，不是失败也不是本地语料
     if (onlineResult.sleeping) {
@@ -1030,7 +1211,9 @@ gameRouter.post('/game/chat', async (req, res) => {
     // failureSink 写 failed=true；这里据此把 source 从 api 分流为 api_fallback，
     // 让 Go 侧能按契约丢弃并改走本地池——修掉"失败被自愈掩盖、玩家被告知 source:'api'"。
     const apiFailed = !!failureSink.failed || !!onlineResult.apiFailed;
-    const burst = chunkToBursts(onlineResult.reply);
+    // T-10：LLM 路径通常已在 prompt 里带了称呼（companion.mjs:402），但必须**同样过一遍守卫**——
+    // 模型回显 `{player_nickname}` / 语料被拼进 prompt 后原样吐回，都靠这一层拦住。
+    const burst = buildChatBurst(onlineResult.reply, c, CALL_NAME_CHANNELS.CHAT);
     return res.json({
       ok: true,
       npc: c.name,
@@ -1060,7 +1243,8 @@ gameRouter.post('/game/chat', async (req, res) => {
   // 若这里错标 api_fallback，Go 会把**好内容当垃圾扔掉**（反而更糟）。
   // "LLM 此刻不可用"这个信息由 `source_reason:'online_path_failed'` 与计数承载，不靠错标正文语义。
   const fallbackReply = getLocalGamerGirlReply(c, text, eventType);
-  const burst = chunkToBursts(fallbackReply);
+  // T-10：本地兜底是**最容易漏占位符**的一条（语料原文直出）——必须过注入
+  const burst = buildChatBurst(fallbackReply, c, CALL_NAME_CHANNELS.CHAT);
   return res.json({
     ok: true,
     npc: c.name,
@@ -1170,10 +1354,15 @@ gameRouter.post('/game/mail', async (req, res) => {
     };
   }
 
-  // 3.1（t29）邮件通道三约束的**唯一执行点**：标题 ≤30B / 正文 ≤360B /
+  // 3.1（t30）称呼注入**必须早于**通道预算执行：注入会改变文本长度，
+  // 先注入再截断，才能保证"截断后的文本里也没有占位符"，也才不会因为注入变长而越界。
+  const mailTitleOut = injectCallNames(mailResult.title, c, { channel: CALL_NAME_CHANNELS.MAIL_TITLE });
+  const mailBodyOut = injectCallNames(mailResult.body, c, { channel: CALL_NAME_CHANNELS.MAIL_BODY });
+
+  // 3.2（t29）邮件通道三约束的**唯一执行点**：标题 ≤30B / 正文 ≤360B /
   // Subject+'\n'+Body < 512B。超界会**可见截断**（WARN + getMailScenarioStats().clamped），
   // 并把实测字节回给 Go 侧（不再像旧实现那样 `slice(0,16)` 静默超界且无度量）。
-  const mailBytes = enforceMailChannelLimits({ title: mailResult.title, body: mailResult.body });
+  const mailBytes = enforceMailChannelLimits({ title: mailTitleOut.text, body: mailBodyOut.text });
   mailResult = { title: mailBytes.title, body: mailBytes.body };
 
   return res.json({

@@ -246,13 +246,21 @@ export async function playgroundChat(companion, userText, { probe = false, failu
       failureSink,
     });
   } catch (err) {
-    // 注意：provider 层存在**会向上抛**的失败路径（例如未配置 API key 时
-    // providers/chat.mjs 直接 throw），这类失败不会经过 generateReply 的 catch，
-    // 因此不会写 failureSink。这里就地补记，保证"失败可见"覆盖两条路径。
+    // 这里兜的是"生成链路就地抛错"的极少数情形（例如 buildSystemPrompt / 模板层异常）。
+    // 注意：**`generateReply` 自身从不 reject** —— 它内部就有 try/catch，provider 失败时
+    // 一律 `return LLM_FALLBACK_REPLY`（见 ai.mjs）。所以"provider 挂了"在本函数里表现为
+    // **成功返回一句固定兜底句**，而不是异常。
+    //
+    // 由此，DNF 适配层（game_dnf.mjs）的两条降级路径各有其真实触发条件（t13 复核后钉死）：
+    //   · 路径①`api_fallback`：provider 快速失败（无 key / 4xx / 5xx / 连接被拒）→ 本函数
+    //     正常返回兜底句 + failureSink.failed=true → 适配层标 `api_fallback`（Go 丢弃正文）；
+    //   · 路径②`local`：本函数在 `CHAT_API_TIMEOUT_MS` 预算内**没返回**（provider 悬挂/慢回包）
+    //     → game_dnf 的 `Promise.race` 超时 → onlineResult=null → 回落本地语料并标 `local`。
+    //     **这条路径是可复现的**（门禁用"黑洞端点 + 短超时"确定性触发），不是死代码。
     genThrow = err;
     log('error', `[Playground] generateReply 失败 companion=${companion.id}: ${err.message}`);
-    // 不再直接 rethrow：DNF 适配层需要一个**有回复**的结果（它自己会按 source 分流）。
-    // 本函数仍保证「要么返回完整结构，要么抛」的一致性——下方统一走本地兜底再返回。
+    // 仍然不 rethrow：DNF 适配层需要一个**结构完整**的结果（它自己按 source 分流），
+    // 且本轮的状态写回（好感/心情）不应因一次生成失败而丢失。下方统一走兜底句再返回。
     reply = null;
   }
   // P0-A + P0-B 的行为约定：只要玩家说了话，本轮就必须产出「可用的回复 + 已推进的状态」。

@@ -22,9 +22,20 @@ const TOKEN = process.env.GAME_TOKEN || 'dnf-local-dev-token';
 async function runUnitChecks() {
   console.log('🧪 [Unit] 1. 检查礼物清单与状态机映射...');
   const gifts = getMailGiftList();
-  if (!gifts || gifts.length !== 7) {
-    throw new Error(`Expected 7 legit gifts, got ${gifts?.length}`);
+  // t38 修：原断言硬编码 `gifts.length !== 7`。2026-10-12 06:36 语料热更合入 v3 后
+  // `mail_templates.json` 从 7 条增到 10 条（新增 reunion/anniversary/after_quarrel 三情境），
+  // 该硬编码随即变红——**不是礼物清单被污染，而是断言把"语料条数"当成了常量**。
+  // 改为按**意图**断言：清单非空、且每一条的道具 ID 都落在核验白名单内
+  // （白名单见 game_dnf.mjs 的 DNF_LEGIT_MAIL_GIFTS 注释：27600/3171/3174/1048/1070/3214）。
+  const VERIFIED_ITEM_IDS = new Set([27600, 3171, 3174, 1048, 1070, 3214]);
+  if (!gifts || gifts.length === 0) {
+    throw new Error(`礼物清单为空（语料加载失败？）`);
   }
+  const unverified = gifts.filter(g => !VERIFIED_ITEM_IDS.has(g.item_id));
+  if (unverified.length > 0) {
+    throw new Error(`清单含未核验道具 ID：${unverified.map(g => `${g.item_id}(${g.name})`).join(', ')}`);
+  }
+  console.log(`   礼物清单 ${gifts.length} 条，道具 ID 全部在白名单内`);
 
   // 1. 无情境默认 -> offline_care
   const sDefault = resolveMailScenario({});

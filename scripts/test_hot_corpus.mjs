@@ -55,14 +55,32 @@ try {
       memory_enabled, affection_level, relationship_stage, current_mood, temperature, max_tokens, top_p)
       VALUES (1, NULL, 'dnf-hot-corpus', ?, 20, '女元素', 'secure', 0, 20, '朋友', '平静', 0.8, 320, 0.95)`)
     .run(NPC);
-  // 睡眠窗口推到 ≥1h 之后（jitter=0），保证任何时刻跑都不会被睡眠门早退
-  ensureSleepRow(1);
+  db.prepare(`INSERT INTO companions (id, user_id, bot_id, name, age, role_title, attachment_style,
+      memory_enabled, affection_level, relationship_stage, current_mood, temperature, max_tokens, top_p)
+      VALUES (2, NULL, 'dnf-hot-corpus', '奶盖小团子', 20, '女召唤', 'secure', 0, 20, '朋友', '平静', 0.8, 320, 0.95)`)
+    .run();
+
+  // ── 睡眠免疫（t38 修：原实现只设了 companion 1）────────────────────────────
+  // 背景：原脚本只对 id=1 设了"窗口推到未来"，而 id=2（奶盖小团子）的睡眠行是由
+  // `maybeSleepBlock` **懒创建**的，取 DB 默认 `enabled=1 / bed 00:30 / wake 07:30`。
+  // 于是当墙钟落在 00:30–07:30 时，小团子的 4 个用例全部拿到 `source=sleeping` 而失败
+  // ——看起来像"语料坏了"，实际是脚本没把测试库置于清醒态（captain 2026-10-12 实测）。
+  // 现在：**所有** companion 一律推到"1 小时后入睡"，并显式断言不处于睡眠态。
   {
     const shNow = new Date(Date.now() + 8 * 3600_000);
-    const bedMin = (shNow.getUTCHours() * 60 + shNow.getUTCMinutes() + 60) % 1440;
+    const nowMin = shNow.getUTCHours() * 60 + shNow.getUTCMinutes();
+    const bedMin = (nowMin + 60) % 1440;
     const wakeMin = (bedMin + 120) % 1440;
     const hhmm = (m) => `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`;
-    upsertSleepSchedule(1, { enabled: 1, bed_time: hhmm(bedMin), wake_time: hhmm(wakeMin), jitter_min: 0 });
+    for (const id of [1, 2]) {
+      ensureSleepRow(id);
+      // 必须清掉 today_* 缓存，否则 getOrRefreshTodaySchedule 会沿用旧窗口
+      upsertSleepSchedule(id, {
+        enabled: 1, bed_time: hhmm(bedMin), wake_time: hhmm(wakeMin), jitter_min: 0,
+        today_date: null, today_bed_at: null, today_wake_at: null,
+      });
+    }
+    console.log(`   [setup] 两个 companion 的睡眠窗已推到未来：bed=${hhmm(bedMin)} wake=${hhmm(wakeMin)}（当前睡眠态免疫）`);
   }
 
   const app = express();
@@ -82,12 +100,6 @@ try {
   console.log('🚀 DNF 恋人伴侣外置语料热更端到端自测（隔离临时语料，不触碰生产）\n');
 
   // ── 1. 语料各场景命中（走本地兜底分支：无 provider 时在线路径失败 → 本地语料）
-  // 小团子也需要一行（同一临时库，仅为让 findCompanion 能命中）
-  db.prepare(`INSERT INTO companions (id, user_id, bot_id, name, age, role_title, attachment_style,
-      memory_enabled, affection_level, relationship_stage, current_mood, temperature, max_tokens, top_p)
-      VALUES (2, NULL, 'dnf-hot-corpus', '奶盖小团子', 20, '女召唤', 'secure', 0, 20, '朋友', '平静', 0.8, 320, 0.95)`)
-    .run();
-
   const scenes = [
     { name: '1. 防 AI 反侦察 [小桃子]', npc: NPC, text: '你是机器人吗？' },
     { name: '2. 作息摸鱼借口 [小团子]', npc: '奶盖小团子', text: '你上课怎么还在玩游戏？' },
@@ -106,6 +118,11 @@ try {
     console.log(`   输入: "${s.text}"`);
     console.log(`   回复: ${r.body.reply}`);
     console.log(`   来源: ${r.body.source}`);
+    // 睡眠免疫的**显式**断言（t38）：若墙钟又落进某个窗口，这里给出直白原因，
+    // 而不是让失败长得像"语料/路由坏了"（原实现缺这条，导致 00:30–07:30 跑必红且难归因）。
+    ok(`${s.name} 未被睡眠门拦截（测试库须处于清醒态）`,
+      r.body.source !== 'sleeping',
+      `source=sleeping（墙钟落进睡眠窗）→ 检查 setup 是否对**该 NPC** 设了未来窗口`);
     ok(`${s.name} 返回非空回复`, r.status === 200 && typeof r.body.reply === 'string' && r.body.reply.length > 0);
     ok(`${s.name} source 在契约内`, ['api', 'api_fallback', 'local', 'proactive_shuffle'].includes(r.body.source),
       `source=${r.body.source}`);

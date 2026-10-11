@@ -24,6 +24,7 @@
 
 import fs from 'node:fs';
 import os from 'node:os';
+import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -67,14 +68,20 @@ for (const f of fs.readdirSync(REAL_CORPUS)) {
 process.env.DB_PATH = TMP_DB;
 process.env.CORPUS_DIR = TMP_CORPUS;
 process.env.LOG_DIR = TMP_LOGS;
+// §17 路径②（`local`）的触发机制是 `CHAT_API_TIMEOUT_MS` 的 `Promise.race` 超时，
+// 而该常量在 game_dnf.mjs **模块加载时**读取，所以必须在这里（import 之前）设短超时，
+// 让 [⑧-C] 能用"黑洞端点 + 短超时"确定性复现该路径（否则要真等 4s）。
+process.env.CHAT_API_TIMEOUT_MS = '400';
 // 关键：确保没有 chat provider，从而必然走"失败兜底"这条要验的路
 delete process.env.CHAT_PROVIDER;
 delete process.env.CHAT_MODEL;
 delete process.env.DEEPSEEK_API_KEY;
 delete process.env.OPENAI_API_KEY;
 delete process.env.GEMINI_API_KEY;
+delete process.env.OPENAI_COMPATIBLE_API_KEY;
+delete process.env.OPENAI_COMPATIBLE_BASE_URL;
 
-console.log('🔬 DNF 大脑 P0 门禁（失败可见性 + 状态写回 + 状态即时化 + 语料可见化）');
+console.log('🔬 DNF 大脑 P0 门禁（失败可见性 + 状态写回 + 状态即时化 + 语料可见化 + §17 三态语义）');
 console.log(`   临时目录: ${TMP}`);
 console.log(`   临时库  : ${TMP_DB}`);
 console.log(`   临时语料: ${TMP_CORPUS}\n`);
@@ -84,7 +91,7 @@ try {
   // ─── 2. 动态 import（env 已就位） ──────────────────────────────────────────
   const express = (await import('express')).default;
   const { getDb, patchCompanion, ensureSleepRow, upsertSleepSchedule } = await import('../src/db.mjs');
-  const { gameRouter, SOURCE, normalizeSource, getCorpusLoadFailures, peekCorpusCache } = await import('../src/game_dnf.mjs');
+  const { gameRouter, SOURCE, SOURCE_REASONS, normalizeSource, getCorpusLoadFailures, peekCorpusCache } = await import('../src/game_dnf.mjs');
   const { consumeReplyFailure, peekReplyFailure } = await import('../src/ai.mjs');
   const { getNeglectStage, buildReunionHint } = await import('../src/emotion_state.mjs');
 
@@ -208,15 +215,30 @@ try {
   ok('邮件正文非空（本地保底信确实产出了内容）',
     typeof rMail.body.body === 'string' && rMail.body.body.length > 0);
 
-  // ── 路径 2 的源码级钉死：return 语句里的 source 必须是 LOCAL + reason=online_path_failed。
-  //    （这条路径需要"playgroundChat 整体 reject"才可达，在门禁里很难稳定复现；
-  //     用源码断言锁住语义，避免后人再把它改成 api_fallback 而 Go 丢内容。）
+  // ── 路径②（`local`）的**源码级**钉死：return 语句里的 source 必须是 LOCAL、reason 必须是
+  //    枚举常量 `SOURCE_REASONS.ONLINE_PATH_FAILED`（t13 F-3 之后 reason 已冻结为枚举，
+  //    不再透传原始 provider 错误串，故断言同步匹配枚举写法）。
+  //    **行为级**可达性证明见下面的 [⑧-C]（黑洞端点 + 短超时），源码断言只是第二道锁。
   {
     const src = fs.readFileSync(path.join(ROOT, 'src', 'game_dnf.mjs'), 'utf8');
-    ok('源码级：在线路径整体失败后的本地兜底标为 local',
-      /source:\s*normalizeSource\(SOURCE\.LOCAL\),\s*\n\s*source_reason:\s*failureSink\.reason \|\| 'online_path_failed'/.test(src));
+    // 允许 `source:` 与 `source_reason:` 之间存在解释性注释（t13 F-3 的说明就在中间）
+    ok('源码级：在线路径整体失败后的本地兜底标为 local + 枚举 reason',
+      /source:\s*normalizeSource\(SOURCE\.LOCAL\)[\s\S]{0,400}?source_reason:\s*SOURCE_REASONS\.ONLINE_PATH_FAILED/.test(src));
     ok('源码级：本地兜底分支不会标成 api_fallback',
-      !/无感退本地[\s\S]{0,900}source:\s*normalizeSource\(SOURCE\.API_FALLBACK\)/.test(src));
+      !/无感退本地[\s\S]{0,1500}source:\s*normalizeSource\(SOURCE\.API_FALLBACK\)/.test(src));
+    // t13 F-3：任何 source_reason 都不得透传原始错误串（`failureSink.reason` / `apiFailureReason`）
+    ok('源码级：source_reason 不再透传原始错误文本（t13 F-3）',
+      !/source_reason:\s*(failureSink\.reason|onlineResult\.apiFailureReason)/.test(src));
+    // t13 F-4：硬编码兜底池不得含禁用称呼。**只扫池子里的字符串字面量**——
+    // 直接扫整段会把"解释为什么禁用"的注释本身（其中必然出现这些词）误判为违规。
+    const poolStart = src.indexOf('const GAMER_GIRL_CHAT_FALLBACK');
+    const poolEnd = src.indexOf('// ── 2.1');
+    const poolBlock = (poolStart >= 0 && poolEnd > poolStart) ? src.slice(poolStart, poolEnd) : '';
+    const poolLiterals = (poolBlock.match(/"[^"\n]*"|'[^'\n]*'/g) || []).join('\n');
+    const bannedHit = /大英雄|勇士大人|冒险家|哥哥|搬砖/.exec(poolLiterals);
+    ok('源码级：硬编码兜底池的**字符串字面量**无禁用称呼/年代雷词（t13 F-4）',
+      poolLiterals.length > 0 && !bannedHit,
+      bannedHit ? `命中「${bannedHit[0]}」` : (poolLiterals.length ? '' : '未能提取池子里的字符串字面量'));
   }
 
   // ─── 门禁 ② 状态写回接缝 ───────────────────────────────────────────────────
@@ -297,11 +319,29 @@ try {
   const cacheWithMarker = peekCorpusCache('peach');
   ok('生效语料确实来自该文件（写入的标记出现在生效缓存里）',
     !!cacheWithMarker?.data?.proactive_greetings?.includes(marker));
-  // 并且回复确实出自这份生效语料（在池内即可，不要求命中特定那一条）
+  // 并且回复确实出自这份生效语料（**确定性**写法：把生效缓存里所有字符串拍平成一个集合，
+  // 断言回复属于它）。旧写法只查 `proactive_greetings` 一个池，隐含假设"问候一定从该池出"——
+  // 但生产 `peach_corpus.json` **没有** `proactive_greetings` 键，问候会继续往下走到
+  // social 池（如"你还在吗？"），于是断言偶发假红（captain 2026-10-12 实测到过）。
+  // 拍平全量字符串既保留了"回复必须来自语料"的强度，又不再依赖具体池名。
+  const corpusStrings = new Set();
+  (function flatten(node) {
+    if (typeof node === 'string') { corpusStrings.add(node); return; }
+    if (Array.isArray(node)) { node.forEach(flatten); return; }
+    if (node && typeof node === 'object') { Object.values(node).forEach(flatten); }
+  })(cacheWithMarker?.data);
   const rFromCorpus = await postChat({ npc: NPC, event_type: 'greeting' });
-  ok('问候回复确实取自生效语料池',
-    (cacheWithMarker?.data?.proactive_greetings || []).includes(rFromCorpus.body.reply),
-    `reply="${String(rFromCorpus.body.reply).slice(0, 30)}"`);
+  ok('问候回复确实取自生效语料（拍平全量字符串后做成员判定，确定性）',
+    corpusStrings.has(rFromCorpus.body.reply),
+    `reply="${String(rFromCorpus.body.reply).slice(0, 30)}" 语料字符串数=${corpusStrings.size}`);
+  ok('前置：拍平结果非空（否则上面的成员判定会退化成恒假）', corpusStrings.size > 0,
+    `size=${corpusStrings.size}`);
+  // 回归：洗牌袋在热更时必须被作废，否则新条目要等旧袋抽完才生效（t38 修）
+  {
+    const srcShuffle = fs.readFileSync(path.join(ROOT, 'src', 'game_dnf.mjs'), 'utf8');
+    ok('源码级：语料重载时作废洗牌袋（热更即刻生效，消除时序竞争）',
+      /if \(Array\.isArray\(shuffleBags\[name\]\)\) shuffleBags\[name\] = \[\]/.test(srcShuffle));
+  }
 
   // 写坏 → 必须被登记为显式失败，且回落到旧缓存
   const failuresBefore = getCorpusLoadFailures().length;
@@ -333,6 +373,38 @@ try {
   ok('同一份坏内容重复请求不重复登记（去重生效）',
     getCorpusLoadFailures().length === dupBefore,
     `之前=${dupBefore} 之后=${getCorpusLoadFailures().length}`);
+
+  // t13 F-5：去重键必须是**文件内容**的 sha1，不能是"错误文本"的 sha1。
+  // 构造场景：两份**内容不同**的坏 JSON，但 JSON.parse 的错误文本逐字相同
+  //（同一偏移位置的同类语法错），实测两者错误串一致：
+  //   A: `{ 这不是合法 JSON `  B: `{ 这也不是合法呀 `  → 都报 "Expected property name or '}' in JSON at position 2 …"
+  // 旧实现（错误文本作键）会把 B 当成 A 的重复而**少报一次**——运维因此不知道另一处内容也坏了，
+  // 属"静默失聪"家族（不是刷屏，而是**漏报**）。内容作键则两份各报一次。
+  {
+    const before = getCorpusLoadFailures().length;
+    // 两份**全新**的坏内容（与上一节写过的那份也不同，否则会被内容 sha1 正确去重）
+    const badA = '{ 甲甲甲不是合法 ';
+    const badB = '{ 乙乙乙也不是合法 ';
+    fs.writeFileSync(peachPath, badA, 'utf8');
+    let t = new Date(Date.now() + 30_000); fs.utimesSync(peachPath, t, t);
+    await postChat({ npc: NPC, event_type: 'greeting' });
+    const afterA = getCorpusLoadFailures().length;
+    fs.writeFileSync(peachPath, badB, 'utf8');
+    t = new Date(Date.now() + 60_000); fs.utimesSync(peachPath, t, t);
+    await postChat({ npc: NPC, event_type: 'greeting' });
+    const afterB = getCorpusLoadFailures().length;
+    ok('[F-5] 内容不同的两份坏语料各告警一次（内容 sha1 作键，不误并）',
+      afterA === before + 1 && afterB === afterA + 1,
+      `计数 ${before} → ${afterA} → ${afterB}`);
+    // 证明测试前提成立：两份内容不同，但错误文本逐字相同（否则这条用例证明不了 F-5）
+    const recs = getCorpusLoadFailures();
+    const mA = recs[afterA - 1]?.message || '';
+    const mB = recs[afterB - 1]?.message || '';
+    const errOf = (m) => (m.split('—').pop() || '').trim();
+    ok('[F-5] 前提成立：两份坏内容的错误文本逐字相同（差异只在内容）',
+      errOf(mA) !== '' && errOf(mA) === errOf(mB),
+      `A=${JSON.stringify(errOf(mA).slice(0, 60))} B=${JSON.stringify(errOf(mB).slice(0, 60))}`);
+  }
 
   // ── 回归：热更新（mtime 变化）仍生效 ──────────────────────────────────────
   console.log('\n[⑤ 回归：热更新仍生效]');
@@ -378,6 +450,115 @@ try {
   const consumed = consumeReplyFailure(1);
   ok('consumeReplyFailure 在没有兜底标记时返回 failed=false（不误报）',
     consumed.failed === false);
+
+  // ── 回归保护（t13 已通过的项不得退化，此处补上缺断言的几条） ────────────────
+  {
+    const aiSrc = fs.readFileSync(path.join(ROOT, 'src', 'ai.mjs'), 'utf8');
+    ok('[回归] 兜底标记 map 有上限 200（防长跑累积）',
+      /_REPLY_FAILURE_MAX\s*=\s*200/.test(aiSrc));
+    ok('[回归] _replyCallSeq 防陈旧：递增 + 取用时比对序号',
+      /_replyCallSeq\s*\+=\s*1/.test(aiSrc) && /hit\.callSeq\s*!==\s*_replyCallSeq/.test(aiSrc));
+    const logSrc = fs.readFileSync(path.join(ROOT, 'src', 'logger.mjs'), 'utf8');
+    ok('[回归] logger.mjs 仅有纯追加的 closeLog（log 本体未被改写）',
+      /export function closeLog\s*\(/.test(logSrc) && /export function log\(level, message\)/.test(logSrc));
+    const pgSrc = fs.readFileSync(path.join(ROOT, 'src', 'playground.mjs'), 'utf8');
+    ok('[回归] last_user_reply_at 写回点仍在（P0-A 接缝）',
+      /patchCompanion\(companion\.id,\s*\{\s*last_user_reply_at/.test(pgSrc));
+  }
+
+  // ═══ ⑧ §17 三态语义：sleeping / api_fallback / local 三者都必须**可达**且语义正确 ═══
+  // 修复背景（t13 F-1/F-2）：
+  //   · 旧实现先要求 `onlineResult.reply` 非空才判 `sleeping`，而睡眠门返回的正是 `reply:null`
+  //     → sleep 分支结构性不可达，且会把"她睡了"错报成 local + reason=online_path_failed；
+  //   · t13 曾判路径②（local）为死代码。本节的 [C] 用"黑洞端点 + 短超时"确定性证明它可达。
+  console.log('\n[⑧ §17 三态语义（t38 修复：sleeping / api_fallback / local 均需可达且语义正确）]');
+
+  const hmOf = (m) => { const v = ((m % 1440) + 1440) % 1440; return `${String(Math.floor(v / 60)).padStart(2, '0')}:${String(v % 60).padStart(2, '0')}`; };
+  const shNowMin = () => { const d = new Date(Date.now() + 8 * 3600_000); return d.getUTCHours() * 60 + d.getUTCMinutes(); };
+  // 睡眠窗设到"包含此刻"（必须清 today_* 缓存，否则 getOrRefreshTodaySchedule 会沿用旧窗）
+  const setSleepWindow = (bedMin, wakeMin) => upsertSleepSchedule(1, {
+    enabled: 1, bed_time: hmOf(bedMin), wake_time: hmOf(wakeMin), jitter_min: 0,
+    today_date: null, today_bed_at: null, today_wake_at: null,
+  });
+
+  // --- A) 睡眠门命中 → source=sleeping + reason=sleep_gate（t13 F-2 修复验证）---
+  {
+    const { isSleepingNow } = await import('../src/sleep.mjs');
+    const n = shNowMin();
+    setSleepWindow(n - 60, n + 60);
+    // 前置自证：窗口真的生效了（否则 [A] 会以"source 不是 sleeping"的形式报错，
+    // 让人误以为是代码没修好，而实际是测试库没进睡眠态）。跨零点等边界都靠这条兜住。
+    ok('[A] 前置：测试库确已进入睡眠态（isSleepingNow=true）',
+      isSleepingNow(1) === true,
+      `nowMin=${n} bed=${hmOf(n - 60)} wake=${hmOf(n + 60)}`);
+    const rSleep = await postChat({ npc: NPC, text: '在吗' });
+    ok('[A] 睡眠门命中 → source=sleeping（旧实现这里会给 local）',
+      rSleep.body.source === SOURCE.SLEEPING, `source=${rSleep.body.source}`);
+    ok('[A] sleeping=true 且 reply 为空（零投递语义）',
+      rSleep.body.sleeping === true && rSleep.body.reply === '',
+      JSON.stringify({ sleeping: rSleep.body.sleeping, reply: rSleep.body.reply }));
+    ok('[A] source_reason=sleep_gate（**不得**再错报 online_path_failed）',
+      rSleep.body.source_reason === SOURCE_REASONS.SLEEP_GATE, `reason=${rSleep.body.source_reason}`);
+    ok('[A] 睡眠态不得带本地语料正文（否则 Go 会把"她睡了"当正常回复转录）',
+      rSleep.body.reply === '' && (rSleep.body.replies || []).length === 0,
+      JSON.stringify(rSleep.body.replies));
+    // 恢复清醒窗，供后续场景使用
+    setSleepWindow(n + 60, n + 180);
+  }
+
+  // --- B) provider 快速失败 → api_fallback（正文=固定兜底句）+ 枚举 reason + 无内部串泄漏（F-3）---
+  {
+    process.env.CHAT_PROVIDER = 'deepseek';
+    delete process.env.DEEPSEEK_API_KEY;
+    const rFast = await postChat({ npc: NPC, text: '在吗' });
+    ok('[B] provider 快速失败 → source=api_fallback（正文=固定兜底句）',
+      rFast.body.source === SOURCE.API_FALLBACK, `source=${rFast.body.source}`);
+    ok('[B] source_reason=llm_failed（枚举值，非原始错误串）',
+      rFast.body.source_reason === SOURCE_REASONS.LLM_FAILED, `reason=${rFast.body.source_reason}`);
+    const bodyStr = JSON.stringify(rFast.body);
+    ok('[B] 响应体不含内部串（API_KEY / .env / provider 名）— t13 F-3',
+      !/API_KEY|\.env|DeepSeek|OPENAI_COMPATIBLE/i.test(bodyStr),
+      bodyStr.slice(0, 180));
+  }
+
+  // --- C) provider 悬挂 → 超时熔断 → source=local（路径②可达性证明）---
+  {
+    const blackhole = net.createServer(() => { /* 接受连接但永不回包：模拟 provider 悬挂 */ });
+    await new Promise(r => blackhole.listen(0, '127.0.0.1', r));
+    try {
+      process.env.CHAT_PROVIDER = 'openai-compatible';
+      process.env.OPENAI_COMPATIBLE_API_KEY = 'dummy';
+      process.env.OPENAI_COMPATIBLE_BASE_URL = `http://127.0.0.1:${blackhole.address().port}/v1`;
+      process.env.CHAT_MODEL = 'gpt-4o-mini';
+      const t0 = Date.now();
+      const rHang = await postChat({ npc: NPC, text: '今天深渊光头了' });
+      const elapsed = Date.now() - t0;
+      // 下界证明"熔断真的触发了"；上界只是防呆（并行 agent 抢 CPU 时放宽，避免假红）
+      ok('[C] 悬挂态在超时预算内回落（证明 CHAT_API_TIMEOUT_MS 熔断真会触发）',
+        elapsed >= 300 && elapsed < 20000, `elapsed=${elapsed}ms`);
+      ok('[C] 路径②**可达** → source=local（t13 曾判死代码，此断言证伪）',
+        rHang.body.source === SOURCE.LOCAL, `source=${rHang.body.source}`);
+      ok('[C] source_reason=online_path_failed（枚举值）',
+        rHang.body.source_reason === SOURCE_REASONS.ONLINE_PATH_FAILED, `reason=${rHang.body.source_reason}`);
+      ok('[C] 正文**取自语料**（不是"走神"那句固定兜底句）',
+        !!rHang.body.reply && !/走神/.test(rHang.body.reply), JSON.stringify(rHang.body.reply));
+      // 强断言：正文必须命中语料的 `abyss.bald_head` 池（"深渊光头"的既定路由）
+      const peachJson = JSON.parse(fs.readFileSync(peachPath, 'utf8'));
+      const baldHead = peachJson.abyss?.bald_head || [];
+      ok('[C] 正文精确来自语料的光头池（abyss.bald_head，路由正确）',
+        baldHead.includes(rHang.body.reply), `reply=${JSON.stringify(rHang.body.reply)}`);
+      ok('[C] 响应体不含内部串 — t13 F-3',
+        !/API_KEY|\.env|OPENAI_COMPATIBLE/i.test(JSON.stringify(rHang.body)));
+      ok('[C] 回复通过了称呼注入守卫（无花括号残留）',
+        !/\{/.test(String(rHang.body.reply)));
+    } finally {
+      blackhole.close();
+      delete process.env.CHAT_PROVIDER;
+      delete process.env.OPENAI_COMPATIBLE_API_KEY;
+      delete process.env.OPENAI_COMPATIBLE_BASE_URL;
+      delete process.env.CHAT_MODEL;
+    }
+  }
 } catch (err) {
   fail++;
   failures.push({ name: '脚本异常', detail: String(err?.stack || err) });

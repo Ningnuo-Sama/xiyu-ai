@@ -521,6 +521,13 @@ export function getMailScenarioStats() {
   return { ..._mailScenarioStats, unknownValues: Object.fromEntries(_unknownScenarioSeen) };
 }
 
+// 邮件**正文**取值来源计数（t41 U4/U5 的可观测半边）
+const _mailTextStats = { degraded: 0, lastWarning: null };
+/** 只读观测口：邮件正文是否发生过"角色/情境降级取用"。 */
+export function getMailTextStats() { return { ..._mailTextStats }; }
+/** 测试用：清零邮件正文计数。 */
+export function resetMailTextStats() { _mailTextStats.degraded = 0; _mailTextStats.lastWarning = null; }
+
 /** 测试用：清零计数（含最近一条告警原文）。 */
 export function resetMailScenarioStats() {
   _mailScenarioStats.resolved = 0;
@@ -1011,9 +1018,19 @@ export function selectMailGift({ scenario, hint = '', targetItemId = 0, targetUp
   const explicitHit = _findExplicitGift(allGifts, targetItemId, targetUpgradeLevel, h);
   if (explicitHit) return explicitHit;
 
+  // ★ U4 修复：**按 scenario 优先过滤**。
+  // 原实现只在全量清单上按 category/item 取"数组序首个匹配"，而 v1 的
+  // recovery/cube/special 条目排在 v3 新增条目之前 → `reunion` 会命中 v1 的
+  // offline_care 泉水（实测：scenario 字段回显 `offline_care`、title "宿舍要熄灯啦~"），
+  // v3 的 reunion 文案永远轮不到。
+  // 现在优先只在**本情境自己的条目**里挑；本情境没有条目时才回落到全量
+  //（保证未知情境/哨兵仍有安全兜底，不改变 v1 三情境的行为）。
+  const scoped = allGifts.filter(g => g.scenario === scenario);
+  const pool = scoped.length > 0 ? scoped : allGifts;
+
   const pick = (...preds) => {
     for (const p of preds) {
-      const hit = allGifts.find(p);
+      const hit = pool.find(p);
       if (hit) return hit;
     }
     return null;
@@ -1070,20 +1087,20 @@ export function selectMailGift({ scenario, hint = '', targetItemId = 0, targetUp
       // 这里只做"安全兜底"，绝不放高强武器。降级可见性由 /game/mail 的
       // scenario_degraded 标记承载（见 handler）。
       return pick(byCategory('recovery'), byCategory('cube'), byCategory('special'), byCategory('abyss_ticket'))
-        || safeNonWeapon(allGifts);
+        || safeNonWeapon(pool) || safeNonWeapon(allGifts);
     }
 
     case MAIL_SCENARIOS.OFFLINE_CARE:
     default: {
       // 晚安送水/日常补给，杜绝高强武器；default 分支同样守住"不落武器"
       if (/圣经|回避|保命|无头/.test(h)) {
-        return pick(byCategory('special'), byItem(1070), byCategory('recovery')) || safeNonWeapon(allGifts);
+        return pick(byCategory('special'), byItem(1070), byCategory('recovery')) || safeNonWeapon(pool) || safeNonWeapon(allGifts);
       }
       if (/无色|大招|晶块|报销/.test(h)) {
-        return pick(byCategory('cube'), byItem(3174), byCategory('recovery')) || safeNonWeapon(allGifts);
+        return pick(byCategory('cube'), byItem(3174), byCategory('recovery')) || safeNonWeapon(pool) || safeNonWeapon(allGifts);
       }
       // 默认送天空之城泉水
-      return pick(byCategory('recovery'), byItem(1048)) || safeNonWeapon(allGifts);
+      return pick(byCategory('recovery'), byItem(1048)) || safeNonWeapon(pool) || safeNonWeapon(allGifts);
     }
   }
 }
@@ -1097,6 +1114,105 @@ function safeNonWeapon(allGifts) {
   return allGifts.find((g) => g.category !== 'pad_weapon' && (g.upgrade_level || 0) === 0)
     || allGifts.find((g) => g.category !== 'pad_weapon')
     || allGifts[0];
+}
+
+// ── 3.5 邮件正文的**角色化**解析（t41 U4 续 / U5） ───────────────────────────
+/**
+ * 为什么需要这一层（实测依据，2026-10-12）：
+ *   · `mail_templates.json` 是**扁平索引**：v1 条目带正文（peach/tuanzi 槽），而 v3 三新情境
+ *     在其中只是**占位条目**——`dialogue.{peach,tuanzi,heika}` **三槽皆空**，title 写的是 reason
+ *     （实测 reunion → title "久别重逢的补给"、三槽长度均 0）。
+ *   · v3 的**正文**按角色分别落在 `{role}_corpus.json` 的 `mail_templates` 里：
+ *     `peach_corpus.json` 42 条（peach 槽 42 非空）、`heika_corpus.json` 46 条（heika 槽 46 非空）、
+ *     **`tuanzi_corpus.json` 0 条**（团子的 v3 邮件正文确实缺失）。
+ * 因此"按 scenario 优先过滤"（U4）只解决**选哪个道具**；正文还必须按角色回填，
+ * 否则 v3 情境会发出**空正文**（比改动前更糟——改动前至少发的是"错情境但非空"的 v1 正文）。
+ *
+ * 解析优先级（逐级降级；**角色不串味**优先于**情境不串味**）：
+ *   ① 索引选中条目的**本角色槽**（v1 三情境走这条，行为与改动前完全一致）
+ *   ② 该角色语料里 **scenario 匹配且本角色槽非空**（v3 正式正文：peach/heika 命中）
+ *   ③ 索引里**同道具、本角色槽非空**（保住角色腔调，牺牲情境贴合；tuanzi 的 v3 走这条）
+ *   ④ 该角色语料里**任意 scenario、本角色槽非空**
+ *   ⑤ 索引选中条目的 peach 槽（最后非空兜底）
+ * ③④⑤ 均标记 `degraded:true`，由 `/game/mail` 透出为可见降级（§11.6：降级必须留痕）。
+ * @returns {{title:string, body:string, source:string, degraded:boolean}}
+ */
+export function resolveMailDialogue(gift, role, scenario) {
+  const slotOf = (e, r) => String((e?.dialogue || {})[r] || '');
+  const titleOf = (e) => String((e?.dialogue || {}).title || '');
+  const roleTemplates = loadRoleMailTemplates(role);
+
+  const own = slotOf(gift, role);
+  if (own) return { title: titleOf(gift), body: own, source: 'index_role_slot', degraded: false };
+
+  const scoped = roleTemplates.filter(e => e.scenario === scenario && slotOf(e, role));
+  if (scoped.length > 0) {
+    const e = pickMailBodyEntry(role, scenario, scoped);
+    return { title: titleOf(e) || titleOf(gift), body: slotOf(e, role), source: 'role_corpus_scoped', degraded: false };
+  }
+
+  const sameItem = getMailGiftList().filter(g => g.item_id === gift.item_id && slotOf(g, role));
+  if (sameItem.length > 0) {
+    const e = sameItem[0];
+    return { title: titleOf(gift) || titleOf(e), body: slotOf(e, role), source: 'index_same_item_role_slot', degraded: true };
+  }
+
+  const anyScen = roleTemplates.filter(e => slotOf(e, role));
+  if (anyScen.length > 0) {
+    const e = pickMailBodyEntry(role, `any:${scenario}`, anyScen);
+    return { title: titleOf(gift) || titleOf(e), body: slotOf(e, role), source: 'role_corpus_any_scenario', degraded: true };
+  }
+
+  const peach = slotOf(gift, 'peach');
+  if (peach) return { title: titleOf(gift), body: peach, source: 'index_peach_fallback', degraded: true };
+
+  return { title: titleOf(gift), body: '', source: 'empty', degraded: true };
+}
+
+// 邮件正文的**分池**洗牌袋：key = `${role}:${scenario}`。
+// 为什么不复用 `shuffleBags[role]`（t41 自测咬出的坑）：那是"每个角色一个袋"，
+// 而本函数面对的是**按情境切分的子池**（reunion 5 条 / anniversary 5 条 / …）。
+// 共用一个袋会让"anniversary 请求"弹出**上一轮 reunion 子池的剩货**——表现为
+// `source=role_corpus_scoped` 但正文不属于该情境（实测踩到过）。
+// 分池后每个 (角色, 情境) 独立轮换，既防复读又不跨情境污染。
+const _mailBodyBags = new Map();
+function pickMailBodyEntry(role, scenarioKey, entries) {
+  const key = `${role}:${scenarioKey}`;
+  let bag = _mailBodyBags.get(key);
+  if (!bag || bag.length === 0) {
+    bag = [...entries].sort(() => Math.random() - 0.5);
+  }
+  const e = bag.pop();
+  _mailBodyBags.set(key, bag);
+  return e || entries[0];
+}
+
+const ROLE_MAIL_KEYS = ['peach', 'tuanzi', 'heika'];
+const roleMailCache = new Map();   // role -> { mtime, data }
+
+/**
+ * 读取某个角色语料文件里的 `mail_templates`（按 mtime 缓存，天然支持热更）。
+ * 缺文件/坏文件一律返回空数组并**不抛**——邮件链路已有自己的本地保底信兜底，
+ * 这里不该成为新的故障点（但空数组会让 `resolveMailDialogue` 走到降级级并在响应留痕）。
+ */
+function loadRoleMailTemplates(role) {
+  if (!ROLE_MAIL_KEYS.includes(role)) return [];
+  const filePath = path.join(CORPUS_DIR, `${role}_corpus.json`);
+  try {
+    if (!fs.existsSync(filePath)) return [];
+    const stat = fs.statSync(filePath);
+    const cached = roleMailCache.get(role);
+    if (cached && cached.mtime === stat.mtimeMs) return cached.data;
+    const arr = JSON.parse(fs.readFileSync(filePath, 'utf-8'))?.mail_templates;
+    const data = Array.isArray(arr) ? arr : [];
+    roleMailCache.set(role, { mtime: stat.mtimeMs, data });
+    // 与 loadCorpusHot 同规则：语料重载即作废洗牌袋（否则新正文要等旧袋抽完才出现）
+    if (Array.isArray(shuffleBags[role])) shuffleBags[role] = [];
+    return data;
+  } catch (err) {
+    log('warn', `[Game] 角色邮件语料加载失败 role=${role}: ${err?.message || err}`);
+    return [];
+  }
 }
 
 /**
@@ -1377,11 +1493,21 @@ gameRouter.post('/game/mail', async (req, res) => {
     targetUpgradeLevel
   });
 
+  // ★ U5 修复：邮件兜底**三分支**（原实现是 `isTuanzi ? tuanzi : peach` → heika 会拿到 peach 文案，
+  // 三人设串味）。角色判定与 `getLocalGamerGirlReply` 的 roleKey 口径保持一致
+  //（`rg -n "let roleKey" src/game_dnf.mjs`），避免同一角色在两处被定成不同的人。
   const isTuanzi = c.name.includes('团子');
-  const localDefault = isTuanzi ? gift.dialogue.tuanzi : gift.dialogue.peach;
+  const isHeika = c.name.includes('黑咖') || c.name.includes('助手');
+  const mailRole = isTuanzi ? 'tuanzi' : (isHeika ? 'heika' : 'peach');
+  // ★ U4 续：正文按**角色**解析（v3 三新情境在索引里是空正文占位，正文在角色语料里）。
+  //   返回 { title, body, source, degraded }，degraded 会在响应里透出（可见降级）。
+  const roleDialogue = resolveMailDialogue(gift, mailRole, scenarioOut);
+  const localDefault = roleDialogue.body || gift.dialogue?.[mailRole] || gift.dialogue?.peach || '';
+  const localTitle = roleDialogue.title || gift.dialogue?.title || '';
 
   // 2. 尝试在线 LLM 生成邮件正文
   let mailResult = null;
+  let usedLocalFallback = false;
   let source = SOURCE.API;
   // P0-B：邮件路径同样用请求级 failureSink 拿到"这次到底成功没成功"
   const failureSink = {};
@@ -1437,10 +1563,19 @@ gameRouter.post('/game/mail', async (req, res) => {
   // "LLM 不可用"由 source_reason 承载——错标 api_fallback 会让 Go 丢掉这封本来可用的信。
   if (!mailResult) {
     source = SOURCE.LOCAL;
+    usedLocalFallback = true;
     mailResult = {
-      title: gift.dialogue.title,
+      title: localTitle || gift.dialogue?.title || '',
       body: localDefault
     };
+    // 正文若走了降级级（③④⑤），必须**可见**：WARN + 计数 + 响应标记（§11.6 铁律）
+    if (roleDialogue.degraded) {
+      _mailTextStats.degraded += 1;
+      const w = `[Game] 邮件正文降级取用（该角色无本情境 v3 正文）：npc=${c.name} role=${mailRole} ` +
+        `scenario=${scenarioOut} 取自=${roleDialogue.source}`;
+      _mailTextStats.lastWarning = w;
+      log('warn', w);
+    }
   }
 
   // 3.1（t30）称呼注入**必须早于**通道预算执行：注入会改变文本长度，
@@ -1480,6 +1615,11 @@ gameRouter.post('/game/mail', async (req, res) => {
       upgrade_level: gift.upgrade_level || 0,
       category: gift.category
     },
+    // t41 U4/U5：正文**取值来源**与是否降级——消费方可据此判断"这封信用的是不是本角色本情境的正文"。
+    // 仅当本轮真的用了本地保底信（LLM 不可用）时才有降级含义；LLM 成功时标 'llm'。
+    mail_text_source: mailResult ? (usedLocalFallback ? roleDialogue.source : 'llm') : 'llm',
+    mail_text_role: mailRole,
+    mail_text_degraded: usedLocalFallback ? roleDialogue.degraded : false,
     source: normalizeSource(source),
     // t13 F-3：同样只放枚举；原始 provider 错误串留在服务端日志，不入响应体。
     ...(failureSink.failed ? { source_reason: SOURCE_REASONS.LLM_FAILED } : {}),

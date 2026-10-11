@@ -36,7 +36,15 @@ const V3_CORPUS = path.resolve(ROOT, '..', 'dnf-robot-act12', 'doc', 'lovers', '
 
 // ─── 邮件通道硬约束（越界 → 客户端开信箱报错误 17） ──────────────────────────
 const LIMITS = { titleBytes: 30, bodyBytes: 360, subjectPlusBodyBytes: 512 };
-const b = (s) => Buffer.byteLength(String(s ?? ''), 'utf8');
+// t41 修正：通道预算是 **GBK(CP936)** 口径（客户端是 GBK），不是 UTF-8。
+// 原实现这里是 `Buffer.byteLength(s,'utf8')`——对短 v1 标题恰好也能过，但 v3 标题更长
+// （如 anniversary 的 title），UTF-8 口径会比 GBK 多算 1B/汉字 → 出现"模块按 GBK 没截断、
+// 断言按 UTF-8 说越界"的**假红**。这正是任务警示的"静默按 UTF-8 计"陷阱。
+// 声明为 `let`：真正的实现要在**动态 import 之后**才能绑上（env 必须先就位），
+// 届时改为模块导出的 `gbkByteLength`（其 CP936 一致性已对 4478 条语料字符串交叉验证）。
+// 不在此处赋初值：真正的实现要在**动态 import 之后**才能绑上（env 必须先就位），
+// 赋了也会被立刻覆盖（eslint no-useless-assignment）。绑定见下方 `b = gbkByteLength`。
+let b;
 
 let pass = 0, fail = 0, skip = 0;
 const failures = [];
@@ -75,11 +83,14 @@ try {
     MAIL_SCENARIOS, MAIL_SCENARIO_UNKNOWN,
     resolveMailScenario, selectMailGift, getMailGiftList,
     getMailScenarioStats, getRegisteredScenarioIds,
+    resolveMailDialogue, gbkByteLength,
     gameRouter,
   } = await import('../src/game_dnf.mjs');
 
   const V3_SCENARIOS = ['reunion', 'anniversary', 'after_quarrel'];
   const V1_SCENARIOS = ['equip_broken', 'offline_care', 'abyss_blank'];
+  // 通道预算断言改用 GBK(CP936) 口径（与模块的 enforceMailChannelLimits 同口径）
+  b = (s) => gbkByteLength(s);
 
   // ═══ ① 三情境已注册（解析层） ═══════════════════════════════════════════
   console.log('[① 三情境注册（resolveMailScenario）]');
@@ -189,13 +200,26 @@ try {
       memory_enabled, affection_level, relationship_stage, current_mood, temperature, max_tokens, top_p)
       VALUES (1, NULL, 'dnf-mail-v3', ?, 20, '女元素', 'secure', 0, 30, '暧昧', '平静', 0.8, 320, 0.95)`)
     .run(NPC);
-  ensureSleepRow(1);
-  {
+  // t41：U5 需要按角色验证"三分支"，故三人设都要播种（黑咖是原实现串味的那一位）
+  db.prepare(`INSERT INTO companions (id, user_id, bot_id, name, age, role_title, attachment_style,
+      memory_enabled, affection_level, relationship_stage, current_mood, temperature, max_tokens, top_p)
+      VALUES (2, NULL, 'dnf-mail-v3', '奶盖小团子', 20, '女召唤', 'secure', 0, 30, '暧昧', '平静', 0.8, 320, 0.95)`)
+    .run();
+  db.prepare(`INSERT INTO companions (id, user_id, bot_id, name, age, role_title, attachment_style,
+      memory_enabled, affection_level, relationship_stage, current_mood, temperature, max_tokens, top_p)
+      VALUES (3, NULL, 'dnf-mail-v3', '黑咖小助手', 20, '女魔道', 'secure', 0, 30, '暧昧', '平静', 0.8, 320, 0.95)`)
+    .run();
+  for (const id of [1, 2, 3]) {
+    ensureSleepRow(id);
+    // 睡眠窗一律推到未来（含清 today_* 缓存），避免墙钟落窗时邮件被睡眠门拦截
     const shNow = new Date(Date.now() + 8 * 3600_000);
     const bedMin = (shNow.getUTCHours() * 60 + shNow.getUTCMinutes() + 60) % 1440;
     const wakeMin = (bedMin + 120) % 1440;
     const hhmm = (m) => `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`;
-    upsertSleepSchedule(1, { enabled: 1, bed_time: hhmm(bedMin), wake_time: hhmm(wakeMin), jitter_min: 0 });
+    upsertSleepSchedule(id, {
+      enabled: 1, bed_time: hhmm(bedMin), wake_time: hhmm(wakeMin), jitter_min: 0,
+      today_date: null, today_bed_at: null, today_wake_at: null,
+    });
   }
   const app = express();
   app.use(express.json({ limit: '64kb' }));
@@ -259,6 +283,94 @@ try {
   // hint 路径也要能命中三新情境
   const rHint = await postMail({ npc: NPC, hint: '好久不见，我终于回来了' });
   ok('[回归] hint 识别重逢情境', rHint.body.scenario === 'reunion', `实际=${rHint.body.scenario}`);
+
+  // ═══ ⑧ t41 U4/U5：三新情境的 **v3 正文可达** + heika 不串味 ═════════════
+  // 背景（实测）：`mail_templates.json` 里 v3 三情境是**空正文占位条目**（三槽长度 0），
+  // v3 正文按角色落在 `{role}_corpus.json` 的 `mail_templates`（peach 42 / heika 46 / **tuanzi 0**）。
+  // 故 U4 分两步：①按 scenario 优先过滤（否则被 v1 的 offline_care 抢先）；②正文按角色回填。
+  console.log('\n[⑧ t41 U4/U5：v3 正文可达 + 角色不串味]');
+
+  const roleCorpus = (role) => {
+    const p = path.join(TMP_CORPUS, `${role}_corpus.json`);
+    const j = JSON.parse(fs.readFileSync(p, 'utf8'));
+    return Array.isArray(j.mail_templates) ? j.mail_templates : [];
+  };
+  const flatIndex = JSON.parse(fs.readFileSync(path.join(TMP_CORPUS, 'mail_templates.json'), 'utf8'));
+
+  for (const sc of V3_SCENARIOS) {
+    // U4-① 场景优先过滤：选中的条目 scenario 字段必须自洽（旧实现会回显 offline_care）
+    const gift = selectMailGift({ scenario: sc });
+    ok(`[U4] ${sc} 选中的条目 scenario 自洽（不再被 v1 抢先）`,
+      gift.scenario === sc, `实际=${gift.scenario}`);
+    // 前置：索引里该情境确实是空正文占位（证明"只改过滤"是不够的，必须角色回填）
+    const stub = flatIndex.find(e => e.scenario === sc);
+    ok(`[U4] 前置：索引里 ${sc} 是空正文占位（故必须角色回填）`,
+      !!stub && ['peach', 'tuanzi', 'heika'].every(r => String(stub.dialogue?.[r] || '') === ''),
+      stub ? JSON.stringify(stub.dialogue) : '未找到条目');
+
+    // U4-② peach / heika 必须有**本角色本情境**的 v3 正文（来自角色语料，非索引占位）
+    for (const role of ['peach', 'heika']) {
+      const d = resolveMailDialogue(gift, role, sc);
+      const pool = roleCorpus(role).filter(e => e.scenario === sc).map(e => String(e.dialogue?.[role] || ''));
+      ok(`[U4] ${sc}/${role} 正文来自角色语料（v3 可达）`,
+        d.source === 'role_corpus_scoped' && d.degraded === false && d.body.length > 0,
+        `source=${d.source} degraded=${d.degraded} len=${d.body.length}`);
+      ok(`[U4] ${sc}/${role} 正文逐字命中该角色语料的 ${sc} 池`,
+        pool.includes(d.body), `pool=${pool.length} 条`);
+    }
+
+    // U5：heika 与 peach 的正文**必须不同**（原实现 heika 取 peach → 串味）
+    const dPeach = resolveMailDialogue(gift, 'peach', sc);
+    const dHeika = resolveMailDialogue(gift, 'heika', sc);
+    ok(`[U5] ${sc}：heika 正文 ≠ peach 正文（不串味）`,
+      dHeika.body !== dPeach.body && dHeika.body.length > 0,
+      `heika=${JSON.stringify(dHeika.body.slice(0, 24))} peach=${JSON.stringify(dPeach.body.slice(0, 24))}`);
+
+    // tuanzi 的 v3 正文确实缺失 → 必须**角色正确 + 可见降级**，绝不发空正文
+    const dTuanzi = resolveMailDialogue(gift, 'tuanzi', sc);
+    ok(`[U4/${sc}] tuanzi 无 v3 正文时不发空正文（降级可见）`,
+      dTuanzi.body.length > 0 && dTuanzi.degraded === true,
+      `source=${dTuanzi.source} degraded=${dTuanzi.degraded} len=${dTuanzi.body.length}`);
+    ok(`[U4/${sc}] tuanzi 降级时仍取**tuanzi 自己**的文案（角色不串味）`,
+      /(泉水|圣经|无色|垫|笨|刷图|图)/.test(dTuanzi.body), JSON.stringify(dTuanzi.body.slice(0, 40)));
+  }
+
+  // 端到端：黑咖私聊 → /game/mail 正文必须与桃子的不同（U5 的行为级证据）
+  for (const sc of V3_SCENARIOS) {
+    const rPeach = await postMail({ npc: '软糖小桃子', scenario: sc });
+    const rHeika = await postMail({ npc: '黑咖小助手', scenario: sc });
+    ok(`[U5][HTTP] ${sc}：黑咖与桃子的邮件正文不同`,
+      rHeika.body.body !== rPeach.body.body
+      && (rHeika.body.body || '').length > 0 && (rPeach.body.body || '').length > 0,
+      `heika=${JSON.stringify(String(rHeika.body.body).slice(0, 20))} peach=${JSON.stringify(String(rPeach.body.body).slice(0, 20))}`);
+    ok(`[U5][HTTP] ${sc}：响应透出正文角色与来源`,
+      rHeika.body.mail_text_role === 'heika' && typeof rHeika.body.mail_text_source === 'string',
+      `role=${rHeika.body.mail_text_role} source=${rHeika.body.mail_text_source}`);
+    ok(`[U5][HTTP] ${sc}：黑咖未走 peach 回退`,
+      rHeika.body.mail_text_source !== 'index_peach_fallback',
+      `source=${rHeika.body.mail_text_source}`);
+    // tuanzi：v3 正文缺失 → 必须**角色正确 + 降级可见**（消费方能识别，不是静默）
+    const rTuanzi = await postMail({ npc: '奶盖小团子', scenario: sc });
+    ok(`[U4][HTTP] ${sc}：团子降级可见（mail_text_degraded=true）且角色自洽`,
+      rTuanzi.body.mail_text_degraded === true
+      && rTuanzi.body.mail_text_role === 'tuanzi'
+      && (rTuanzi.body.body || '').length > 0,
+      `degraded=${rTuanzi.body.mail_text_degraded} role=${rTuanzi.body.mail_text_role} src=${rTuanzi.body.mail_text_source}`);
+    ok(`[U4][HTTP] ${sc}：团子正文 ≠ 桃子正文（降级也不串味）`,
+      rTuanzi.body.body !== rPeach.body.body,
+      `tuanzi=${JSON.stringify(String(rTuanzi.body.body).slice(0, 18))}`);
+  }
+
+  // GBK 计数器口径自证：Node 的 Buffer.byteLength(s,'gbk') 会静默按 UTF-8 计（中文 3B/字），
+  // 本项目的手写计数器按 CP936 口径（中文 2B/字）。这里锁住"没被改成 UTF-8 口径"。
+  {
+    ok('[GBK] 计数器按 CP936 口径（中文 2B/字，不是 UTF-8 的 3B）',
+      gbkByteLength('天空之城泉水') === 12 && gbkByteLength('中文a1') === 6,
+      `天空之城泉水=${gbkByteLength('天空之城泉水')} 中文a1=${gbkByteLength('中文a1')}`);
+    ok('[GBK] 计数器与 Buffer.byteLength(...,"utf8") 的口径确实不同（防静默退化）',
+      gbkByteLength('中文') === 4 && Buffer.byteLength('中文', 'utf8') === 6,
+      `gbk口径=${gbkByteLength('中文')} utf8=${Buffer.byteLength('中文', 'utf8')}`);
+  }
 } catch (err) {
   fail++;
   failures.push({ name: '脚本异常', detail: String(err?.stack || err) });

@@ -104,4 +104,46 @@ if (!heika) {
   console.log('ℹ️ 黑咖小助手 已存在');
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. 逐角色 T0/T1 默认称呼播种（t40）
+//
+// 背景：注入器 resolveCallNames() 的冻结降级链是
+//   shaping.nickname → companions.player_nickname → 人设 T1 默认叫法(call_user_as) → 「你」
+// 生产三条 companion 的 call_user_as 原本都还是 DB 默认值 '你'，于是
+// {player_nickname} 渲染成「你」，出现「你，你今天怎么这么慢呀」这类重复读感。
+//
+// 下面三条默认叫法的**权威来源是 t6 §2.2 的档位语义**（播种数据，不是代码里的硬编码兜底）：
+//   软糖小桃子「哎——」／奶盖小团子「喂」／黑咖小助手「同学」
+// 黑咖刻意取「同学」而不取「喂」，与团子拉开距离——两人都用「喂」会让遮名辨识退化。
+//
+// 幂等与非破坏（本任务硬约束）：
+//   · 只在该行 call_user_as 为空/NULL/仍是泛化默认 '你' 时才写；
+//   · 玩家已定昵称、或命名事件已改写的值**绝不覆盖**；
+//   · 不触碰 player_nickname / exonym（那是命名事件与「她给你起外号」的写入位，此处只留位）；
+//   · 重复执行第二次起 changes = 0。
+const DEFAULT_CALL_USER_AS = {
+  '软糖小桃子': '哎——',
+  '奶盖小团子': '喂',
+  '黑咖小助手': '同学',
+};
+
+let seededRows = 0;
+for (const [name, call] of Object.entries(DEFAULT_CALL_USER_AS)) {
+  const row = db.prepare('SELECT id, call_user_as FROM companions WHERE name = ?').get(name);
+  if (!row) continue;
+  const cur = String(row.call_user_as ?? '').trim();
+  if (cur !== '' && cur !== '你') {
+    console.log(`ℹ️ 默认称呼保留原值（不覆盖）: ${name} → ${cur}`);
+    continue;
+  }
+  const info = db.prepare(
+    `UPDATE companions
+        SET call_user_as = ?, nickname_level = COALESCE(nickname_level, 0)
+      WHERE id = ? AND (call_user_as IS NULL OR TRIM(call_user_as) = '' OR TRIM(call_user_as) = '你')`,
+  ).run(call, row.id);
+  seededRows += info.changes;
+  console.log(`✅ 播种默认称呼: ${name} → ${call}（changes=${info.changes}）`);
+}
+console.log(`🎉 默认称呼播种完成（本次写入 ${seededRows} 行；幂等，重复执行应为 0）`);
+
 console.log('🎉 恋人角色基线数据初始化完成！');

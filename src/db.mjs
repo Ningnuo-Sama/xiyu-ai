@@ -1440,6 +1440,16 @@ function migrateCompanions() {
     // 而不是假装共鸣。与 forbidden_topics 区别：forbidden 是"完全不聊"，dislikes
     // 是"会聊但表达不喜欢"。
     ['dislikes',              "TEXT DEFAULT '[]'"],
+    // t40：称呼成长系统的持久化字段（**加法迁移**，定调 §18 T-10 / t6 §2.4）。
+    //   player_nickname —— 命名事件「玩家自定义昵称」的镜像列；
+    //                      权威写入口仍是 companion_shaping(kind='nickname')，
+    //                      本列只是便于 companion 行一次性读出的镜像（可空）。
+    //   exonym          —— 她给玩家起的外号（T3/T4；t6 §2.8 外号池）。
+    //   nickname_level  —— 称呼档位 T0~T4 对应 0~4（t6 §2.2 五档梯度）。
+    // 三列均无 NOT NULL / 无 DEFAULT 之外的约束，故对既有库与既有行零破坏。
+    ['player_nickname',       'TEXT'],
+    ['exonym',                'TEXT'],
+    ['nickname_level',        'INTEGER DEFAULT 0'],
   ];
   for (const [col, def] of cols) addColIfMissing('companions', col, def);
 }
@@ -1876,6 +1886,8 @@ export const ALLOWED_FIELDS = new Set([
   'voice_reply_enabled', 'voice_id',
   'voice_reply_enabled', 'sticker_reply_enabled',
   'call_user_as', 'user_call_her_as',
+  // t40：称呼成长字段（必须在此白名单内，否则 buildUpsertFields/导出会静默丢列）
+  'player_nickname', 'exonym', 'nickname_level',
   'persona_prompt', 'forbidden_topics', 'dislikes',
   // 新增
   'memory_enabled', 'current_mood', 'affection_level', 'relationship_stage',

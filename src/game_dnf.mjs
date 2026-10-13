@@ -30,6 +30,11 @@ import {
   NICKNAME_MAX_GBK_BYTES,
   NICKNAME_COLLECT_MAX_CHARS,
 } from './nickname_gate.mjs';
+// t133：「太长 ⇒ 给候选」的**离线派生**（纯文本规则）与**可选模型增强**的纯函数层。
+// 两者都只产出候选**文本**，能不能落库一律由上面的门禁本体判定（零第二套判定）。
+import { deriveNicknameTexts, collectLlmNicknameTexts } from './nickname_suggest.mjs';
+// 模型增强走仓库既有调用方式（providers/chat.mjs），不另起一套 HTTP 客户端。
+import { chatComplete } from './providers/chat.mjs';
 
 export const gameRouter = Router();
 
@@ -1734,9 +1739,11 @@ gameRouter.post('/game/mail', async (req, res) => {
 // ——两份实现必然漂移（规则线刚吃过这个教训：JS 标尺全绿证不了 Go 行为）。
 // ⇒ Go 只负责"问 / 收 / 转发 / 渲染"，判定唯一在本文件背后的纯函数里。
 //
-// ## 三条硬约束（t127 契约）
-//   1. **不调用任何模型**：三条路径全是纯规则函数（`extractNicknameCandidate` /
+// ## 三条硬约束（t127 契约；t133 对第 1 条加了一个**默认关闭**的例外）
+//   1. **默认不调用任何模型**：抽取/校验全是纯规则函数（`extractNicknameCandidate` /
 //      `validateNicknameCandidate`），**无 Key 也能用**——这是"离线可捕获"的实现前提。
+//      t133 起 `/game/nickname/extract` 的"太长 ⇒ 给候选"分支可选调模型（`NICKNAME_SUGGEST_LLM=1`），
+//      **默认关闭**、且失败/超时/无 Key 一律静默回落离线派生 ⇒ 上面这条前提不被破坏。
 //   2. **不绕过 G-N1**：写路径**只经** `setCompanionNickname`（唯一写入口），
 //      校验→写入的机械顺序由 db.mjs 保证（直调 `upsertShaping(kind='nickname')` 仍抛错）。
 //   3. **返回体可判定**：抽取三态 + 每个候选的门禁结论（`gate.ok` / `gate.code`）
@@ -1750,7 +1757,12 @@ gameRouter.post('/game/mail', async (req, res) => {
 //       candidate:{...}|null,      // 首个候选的便捷视图
 //       will_persist:bool,         // **可落库** == kind==='accepted' && candidate.gate.ok
 //       action:'persist'|'ask_again'|'offer_candidates'|'declined'|'retry',
-//       limits:{ max_chars, max_gbk_bytes, collect_max_chars }, model_called:false }
+//       // t133：仅 offer_candidates 分支非空；每条自身过了 G-N1；**允许少于 3 条**
+//       suggestions:[{ text, chars, bytes, gate:{ok:true}, via,
+//                      source:'llm'|'derived'|'pool', rule:'tail_core'|'prefix2'|'repeat_head'|'single'|'llm_pick'|'pool' }],
+//       suggestion_pool_key:string|null,
+//       suggestion_llm:{ enabled, called, ok, reason }|null,
+//       limits:{ max_chars, max_gbk_bytes, collect_max_chars }, model_called:bool }
 //   POST /game/nickname/set（写；**必须带规则抽取产出的 candidate**）
 //     { ok:true, text, nickname_state:{...} } | 400 { ok:false, error, code? }
 //   GET  /game/nickname/state?npc=&user_id=
@@ -1758,30 +1770,40 @@ gameRouter.post('/game/mail', async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 「太长 ⇒ 给候选」（t129）
+// 「太长 ⇒ 给候选」（t129 建 / **t133 重写派生规则**）
 //
-// ## 为什么是"机械派生"而不是"编名字"
+// ## 为什么是"派生"而不是"编名字"
 // 设计 §2.7 要求"太长时必须给 2~3 个候选"，但**凭空造句**会让玩家看到一个
-// 与她/他毫无关系的名字。故本实现只做**可复述、可单测**的机械派生：
-//   给定过长候选 c（7~8 字）：
-//     ① 前缀 2 字：c.slice(0,2)        （"abcdefg" → "ab"）
-//     ② 首字叠用：c[0] + c[0]          （"abcdefg" → "aa"）
-//     ③ 单字：    c[0]                  （"abcdefg" → "a"）
-//   去重后**保留顺序**，最多 3 条。
-// **不做的**：不拼后缀（"宝/儿/子"这类甜称呼会踩人设禁忌）、不做音译、不造句。
+// 与她/他毫无关系的名字。故本实现只做**可复述、可单测**的候选派生。
+//
+// ## t133 为什么要重写（用户实测反馈）
+// 旧规则只会**从头砍一刀**：对「超级无敌大魔王」给 `超级 / 超超 / 超`——**丢了语义核心**，
+// 没有一条是真人会给朋友起的短名。新规则先回答"真人会怎么叫"，再落成机器可判定的步骤：
+//   · 剥程度/修饰前缀（超级、无敌、最强…，反复剥；**绝不剥 大/小/老/阿**）
+//   · 取**尾部语义核**（"大魔王"= 3 字；尾窗里出现 小/阿/老/大 就从它重新锚定）
+//   · 质量过滤（虚词/纯数字/纯修饰字/长度/互相包含 ⇒ 全挡掉）
+//   · 旧的"前缀 2 字 / 首字叠用 / 单字"**保留为补充来源**，排在尾部语义核之后
+// 规则本体在 `nickname_suggest.mjs`（纯函数、可单测）；本文件只负责**接入与门禁回灌**。
+// **拿不出像人话的结果就不硬给**：`suggestions` 允许少于 3 条，甚至为空数组。
+//
+// ## 三条来源的优先级（t133 冻结）
+//   ① `llm`     模型候选（**默认关闭**；见 NICKNAME_SUGGEST_LLM。可用时排最前，最多 2 条）
+//   ② `derived` 离线派生（核心；**无模型也必须有产出**——这是主路径，不是兜底）
+//   ③ `pool`    人设候选池补足（`naming.nickname_candidate_pool`，她自己的私心叫法）
+// 总数 ≤3、按门禁后的文本去重、顺序即优先级。
 //
 // ## 每条候选必须"自己过自己的门禁"
-// 这是本任务最容易出荒谬态的地方：**她给出一个她自己都不收的名字**。
+// 这是最容易出荒谬态的地方：**她给出一个她自己都不收的名字**。
 // 故每条候选都要**原样回灌** `extractNicknameCandidate` 再 `validateNicknameCandidate`
 // ——不是"我确信它会过"，而是**让它真的过一次**（与 G-N1 同一判定，零第二套实现）。
 // 过不了的一律剔除；全被剔除则 `suggestions: []`。
+// 模型候选与人设池条目**同样逐条回灌**（模型会说胡话、静态语料也可能被改坏）。
 //
 // ## 与兜底池（t130）协作：**只消费、不硬编码键名**
-// 池的语料键名由 t130 定稿 ⇒ 本文件**不写死任何一个键**，而是：
-//   · 优先读 `NICKNAME_SUGGEST_POOL_KEY`（t130 定稿后由配置指过去，一行配置即接上）；
-//   · 否则按候选名探测（`nickname_suggestions` / `exonym_pool` / …），命中即用；
-//   · 都拿不到 ⇒ **纯派生**，**绝不报错**（缺池是正常态，不是故障）。
-// 响应里回显 `pool_key`（命中键名或 null）⇒ 键名漂移会**在测试里显形**，而不是静默失效。
+// 池的语料键名由 t130 定稿 ⇒ 本文件**不写死任何一个键**（`NICKNAME_POOL_KEY` 一处集中）；
+// 语料文件按**该角色自己的语料**优先解析（三人池各不相同），再按候选名探测兜底；
+// 都拿不到 ⇒ **纯派生**，**绝不报错**（缺池是正常态，不是故障）。
+// 响应里回显 `suggestion_pool_key`（命中键名或 null）⇒ 键名漂移会**在测试里显形**。
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** 名称 → 语料 roleKey（peach/tuanzi/heika）。口径与既有 roleKey 判定一致，避免同一角色被定成不同的人。 */
@@ -1798,15 +1820,43 @@ function findRoleKeyByName(name) {
  * ⚠️ **这不是产品可调参数，而是"池补位"路径的测试钩子**（与 `photo_planner.mjs` 的
  * `PHOTO_TEST_HOUR` 同一惯例：**仅当显式设置才生效，生产不设**）。
  *
- * 为什么需要它：派生规则对"过长候选"恒产出 3 条不同文本（前缀2字 / 首字叠用 / 单字），
- * 而 `max` 也是 3 ⇒ **池补位分支在生产输入下永远走不到**。t129 我如实上报了"不可达"，
- * captain 裁定「**不可达 ≠ 可以不测**」（F-31 生产死代码的教训）：**用 fixture 把它打通并测掉**。
- * 故这里留一个**只影响派生条数**的窄口子：测试把它设成 1，池补位路径即可被真正执行与断言。
+ * 为什么需要它：`max` 是 3，而派生在多数输入下也能占满 3 ⇒ 池补位分支**可能走不到**。
+ * t129 我如实上报了"不可达"，captain 裁定「**不可达 ≠ 可以不测**」（F-31 生产死代码的教训）：
+ * **用 fixture 把它打通并测掉**。故这里留一个**只影响派生条数**的窄口子：测试把它设成 1，
+ * 池补位路径即可被真正执行与断言。
  *
  * 另外明确一条口径：**不得为了"让池出场"而把生产默认改小**（那是为了让测试好看而改产品行为）；
  * 派生来自玩家自己的输入（更 personal）⇒ **派生优先是正确的**，池是安全网。
+ * t133 起派生规则变聪明了（"超级无敌大魔王"只派生出 1 条"大魔王"）⇒ 池**在真实输入上**
+ * 也会自然出场，这个钩子退化为"额外的可控性"，不再是唯一入口。
  */
 const NICKNAME_MAX_DERIVED = Math.max(1, Number(process.env.NICKNAME_MAX_DERIVED || 3));
+
+/**
+ * 模型增强开关（**默认关闭**）——`NICKNAME_SUGGEST_LLM=1` 才启用。
+ *
+ * 为什么默认关：`/game/nickname/extract` 在**聊天主链路**上被 Go 侧同步调用，
+ * 而本端点的既有契约（route 注释 / t127 定调 / 演示脚本）都写着"纯规则、不调模型"。
+ * 默认开启＝**静默改变生产延迟与成本**，且会让 `model_called` 的口径失真。
+ * 故：**显式开关才启用**；启用后无 Key / 不可用 / 超时一律**静默回落**离线派生。
+ *
+ * `NICKNAME_SUGGEST_LLM_STUB` 是**注入式桩件**（本机没有可用模型时测通接线用）：
+ *   · `__error__`   ⇒ 桩件抛错（模拟无 Key / provider 报错）
+ *   · `__timeout__` ⇒ 桩件挂起（模拟超时；配合 `NICKNAME_SUGGEST_LLM_TIMEOUT_MS`）
+ *   · 其他字符串    ⇒ 当作"模型回复"原文（测解析 + 接线 + 门禁回灌）
+ */
+const NICKNAME_LLM_ENABLED = String(process.env.NICKNAME_SUGGEST_LLM || '').trim() === '1';
+const NICKNAME_LLM_TIMEOUT_MS = Math.max(200, Number(process.env.NICKNAME_SUGGEST_LLM_TIMEOUT_MS || 3000));
+const NICKNAME_LLM_STUB = String(process.env.NICKNAME_SUGGEST_LLM_STUB || '');
+/** 模型最多占几个名额：留 1 个给离线语义核（模型也会挑错，核心候选要有位置）。 */
+const NICKNAME_LLM_MAX_TAKEN = 2;
+
+/** 把 `NICKNAME_SUGGEST_LLM_STUB` 解释成注入式桩件（见上）。 */
+function makeNicknameLlmStub(raw) {
+  if (raw === '__error__') return () => { throw new Error('nickname_llm_stub_error'); };
+  if (raw === '__timeout__') return () => new Promise(() => {});
+  return () => raw;
+}
 
 /**
  * 兜底池的语料键名 —— **由 t130 定稿，本文件不得另起一个名字**。
@@ -1820,45 +1870,57 @@ const NICKNAME_POOL_KEY = 'naming.nickname_candidate_pool';
 /** 该键可能落在哪些命名语料文件里（按序探测；都不存在 ⇒ 无池，**不是错误**）。 */
 const NICKNAME_POOL_CORPUS_CANDIDATES = ['naming', 'peach', 'tuanzi', 'heika'];
 
-/** 已探到的池位置缓存（**只缓存"找到了"**；未找到不缓存）。 */
-let _nicknamePoolLocation = null;
+/** 已探到的池位置缓存（**只缓存"找到了"**；未找到不缓存）。key = roleKey（无角色用 ''）。 */
+const _nicknamePoolLocationByRole = new Map();
 
 /**
- * 按「env 覆盖 → 命名语料文件」定位兜底池；取不到返回 null（**不是错误**）。
+ * 按「env 覆盖 → **该角色自己的**语料 → 候选语料名」定位兜底池；取不到返回 null（**不是错误**）。
  *
  * ⚠️ **不缓存"没找到"**（t129 实测踩到）：若把"未命中"也缓存成 null，则**池是后加的**
  * 情形（t130 先交付代码、语料随后落盘 / 热更新增池文件）在**进程不重启**时永远探不到——
  * 表现为"语料加了但端点一直说没池"，且**不报错**（最坏的那种静默失效）。
  * 负结果不缓存 ⇒ 下一个请求会重新探测；而探测本身走 `loadCorpusHot`（有 mtime 缓存），
  * 代价只是几次 stat，可接受。
+ *
+ * ⚠️ **按角色取池**（t133 修）：三人的人设池**各不相同**（桃子 小甜甜/糖糖…、
+ * 团子 麻烦精/慢吞吞…、黑咖 变量/对照组…），而语料文件是**一人一档**
+ * （`peach_corpus.json` 等）。旧实现按固定顺序探测、**永远先命中 peach** ⇒
+ * 团子/黑咖 会拿到桃子的池（"她自己的私心叫法"变成别人的）——这种"键名对了、内容错了"
+ * 依旧不报错。故改为：**先看该角色自己的语料**，再按候选名兜底探测；缓存也按角色分开。
  */
-function resolveNicknamePoolKey() {
+function resolveNicknamePoolKey(roleKey = null) {
   const explicit = String(process.env.NICKNAME_SUGGEST_POOL_KEY || '').trim();
   // ⚠️ 返回值**形状必须统一**为 `{corpus, key}`：env 覆盖给的是一段文本（既当 corpus 名、
   // 也当返回给调用方的键名），不能直接返回字符串——否则下游读 `loc.key` 会得到 undefined，
   // 表现为"池读到了、键名却丢了"（t129 实测踩到，且**不报错**）。`key` 一律取用户给的名字。
   if (explicit) return { corpus: explicit, key: explicit };
+  const cacheKey = roleKey || '';
   // ⚠️ 缓存的**命中**也要复核仍然成立（t132 实测踩到）：若只信缓存，则池文件被**删除/改名**
   // 之后仍会声称"池在这儿"（`pool_key` 回显非 null、items 却是空），又是一种静默失效。
   // 正确做法：缓存只用来**跳过探测顺序**，命中成立与否仍以"当前能读出来"为准。
-  if (_nicknamePoolLocation) {
-    const cached = loadCorpusHot(_nicknamePoolLocation.corpus);
-    if (cached && pickStringArrayAt(cached, _nicknamePoolLocation.key).length) return _nicknamePoolLocation;
-    _nicknamePoolLocation = null;   // 缓存已失效 ⇒ 清掉后重新探测
+  const cachedLoc = _nicknamePoolLocationByRole.get(cacheKey);
+  if (cachedLoc) {
+    const cached = loadCorpusHot(cachedLoc.corpus);
+    if (cached && pickStringArrayAt(cached, cachedLoc.key).length) return cachedLoc;
+    _nicknamePoolLocationByRole.delete(cacheKey);   // 缓存已失效 ⇒ 清掉后重新探测
   }
-  for (const name of NICKNAME_POOL_CORPUS_CANDIDATES) {
+  const probes = [];
+  if (roleKey) probes.push(roleKey);
+  for (const name of NICKNAME_POOL_CORPUS_CANDIDATES) if (!probes.includes(name)) probes.push(name);
+  for (const name of probes) {
     const parsed = loadCorpusHot(name);   // 不存在 ⇒ null（不抛）
     if (parsed && pickStringArrayAt(parsed, NICKNAME_POOL_KEY).length) {
-      _nicknamePoolLocation = { corpus: name, key: NICKNAME_POOL_KEY };
-      return _nicknamePoolLocation;
+      const loc = { corpus: name, key: NICKNAME_POOL_KEY };
+      _nicknamePoolLocationByRole.set(cacheKey, loc);
+      return loc;
     }
   }
   return null;
 }
 
-/** 按 `{corpus,key}` 或裸键名取池候选；读不到 ⇒ 空数组（**不抛**）。 */
+/** 按角色取池候选；读不到 ⇒ 空数组（**不抛**）。 */
 function loadNicknameSuggestionPool(roleKey) {
-  const loc = resolveNicknamePoolKey();
+  const loc = resolveNicknamePoolKey(roleKey);
   if (!loc) return { key: null, items: [] };
   // 形状已统一为 `{corpus,key}`（见 resolveNicknamePoolKey），此处不再分支处理字符串。
   const parsed = readPoolJson(loc.corpus);
@@ -1910,40 +1972,61 @@ function validatedSuggestionFromText(text) {
 }
 
 /**
- * 为"过长候选"生成建议：**派生优先 → 池补足 → 都没有就空数组**。
- * 每条都**真的过了一次 G-N1**（`validatedSuggestionFromText`），并标 `source`。
+ * 为"过长候选"生成建议（t133 三层顺序）：
+ *   **① 模型候选（若启用且可用）→ ② 离线派生 → ③ 人设池补足 → 都不够就少于 3 条**。
+ *
+ * 每条都**真的过了一次 G-N1**（`validatedSuggestionFromText`：extract → validate 两步），
+ * 并标 `source`（`llm`|`derived`|`pool`）与 `rule`（哪条规则/哪个来源）。
+ * 模型不可用 ⇒ **静默回落**（`collectLlmNicknameTexts` 永不抛），**绝不因为没有模型就空手**。
+ *
+ * @returns {Promise<{items:Array, poolKey:string|null, llm:object}>}
  */
-function buildNicknameSuggestions(longText, roleKey, max = 3) {
+async function buildNicknameSuggestions(longText, roleKey, max = 3) {
   const c = String(longText ?? '');
-  const chars = [...c];
-  const derivedTexts = [];
-  if (chars.length >= 2) derivedTexts.push(chars.slice(0, 2).join(''));   // ① 前缀 2 字
-  if (chars.length >= 1) derivedTexts.push(chars[0] + chars[0]);          // ② 首字叠用
-  if (chars.length >= 1) derivedTexts.push(chars[0]);                     // ③ 单字
-
   const items = [];
   const seen = new Set();
-  const push = (text, source) => {
+  const push = (text, source, rule) => {
     if (items.length >= max) return;
     const v = validatedSuggestionFromText(text);
     if (!v) return;                    // 过不了门禁的候选一律不出现
     if (seen.has(v.text)) return;      // 去重（按**门禁后的**文本）
     seen.add(v.text);
-    items.push({ ...v, source });
+    items.push({ ...v, source, ...(rule ? { rule } : {}) });
   };
 
-  // ① 派生优先：取前 N 条派生（N 默认 3；测试可用 NICKNAME_MAX_DERIVED 压到 1，见该常量注释）
-  for (const t of derivedTexts.slice(0, NICKNAME_MAX_DERIVED)) push(t, 'derived');
-  // ② 池补足：**总是尝试**读取兜底池，以便如实回显命中的键名（键名漂移要能显形）。
-  //    `push` 内部有 `max` 上限 ⇒ 派生已占满时池条目自然落不进来，"派生优先"不被破坏；
-  //    派生不足 3 条时才真正轮得到池（缺池 ⇒ items 空 ⇒ 纯派生，**不报错**）。
+  // ① 模型候选（**默认关闭**；见 NICKNAME_LLM_ENABLED）。失败/超时/无 Key ⇒ texts 为空。
+  const llm = await collectLlmNicknameTexts(c, {
+    enabled: NICKNAME_LLM_ENABLED,
+    chat: chatComplete,
+    stub: NICKNAME_LLM_STUB ? makeNicknameLlmStub(NICKNAME_LLM_STUB) : null,
+    timeoutMs: NICKNAME_LLM_TIMEOUT_MS,
+    maxTexts: NICKNAME_LLM_MAX_TAKEN,
+  });
+  if (llm.called && !llm.ok) {
+    // 静默回落要有痕：日志留一行，响应里给机械可判的 reason（但不外泄错误细节）。
+    log('warn', `[nickname] 模型增强不可用（${llm.reason}）⇒ 回落离线派生`);
+  }
+  for (const t of llm.texts) push(t, 'llm', 'llm_pick');
+
+  // ② 离线派生（核心；无模型也必须有产出）。取前 N 条（N 默认 3；测试可用 NICKNAME_MAX_DERIVED 压小）。
+  const derived = deriveNicknameTexts(c);
+  for (const d of derived.slice(0, NICKNAME_MAX_DERIVED)) push(d.text, 'derived', d.rule);
+
+  // ③ 池补足：**总是尝试**读取兜底池，以便如实回显命中的键名（键名漂移要能显形）。
+  //    `push` 内部有 `max` 上限 ⇒ 前面已占满时池条目自然落不进来，"派生优先"不被破坏；
+  //    不足 3 条时才真正轮得到池（缺池 ⇒ items 就这些 ⇒ 纯派生，**不报错**）。
   const pool = loadNicknameSuggestionPool(roleKey);
-  for (const t of pool.items) push(t, 'pool');
-  return { items, poolKey: pool.key };
+  for (const t of pool.items) push(t, 'pool', 'pool');
+
+  return {
+    items,
+    poolKey: pool.key,
+    llm: { enabled: NICKNAME_LLM_ENABLED, called: llm.called, ok: llm.ok, reason: llm.reason },
+  };
 }
 
 /** 把一次抽取结果渲染成 Go 可直接分支的形状（纯函数，不落库）。 */
-function renderNicknameExtraction(rawText, roleKey = null) {
+async function renderNicknameExtraction(rawText, roleKey = null) {
   const extracted = extractNicknameCandidate(rawText);
   const candidates = (extracted.candidates || []).map((cand) => {
     const gate = validateNicknameCandidate(cand);
@@ -1984,10 +2067,12 @@ function renderNicknameExtraction(rawText, roleKey = null) {
   //（正常/未解析/拒答都不该被塞候选——那会把"再问一次"变成"替你决定"）。
   let suggestions = [];
   let suggestionPoolKey = null;
+  let suggestionLlm = null;
   if (action === 'offer_candidates' && candidate && candidate.text) {
-    const built = buildNicknameSuggestions(candidate.text, roleKey);
+    const built = await buildNicknameSuggestions(candidate.text, roleKey);
     suggestions = built.items;
     suggestionPoolKey = built.poolKey;
+    suggestionLlm = built.llm;
   }
 
   return {
@@ -1998,23 +2083,28 @@ function renderNicknameExtraction(rawText, roleKey = null) {
     candidate,
     will_persist: willPersist,
     action,
-    // t129：「太长时给候选」——每条都**自身过了 G-N1**，并标 source='derived'|'pool'。
+    // t133：「太长时给候选」——每条都**自身过了 G-N1**，并标 source='llm'|'derived'|'pool'
+    // + rule（哪条规则）。**允许少于 3 条**（拿不出像人话的就不硬给）。
     // Go 侧可直接把 `suggestions[i]`（含 via 回执）原样回传给 /set。
     suggestions,
     // 回显命中的池键名（未命中为 null）⇒ 键名漂移在测试里显形，而不是静默失效。
     suggestion_pool_key: suggestionPoolKey,
+    // 模型增强的机械状态（默认 `{enabled:false, called:false, reason:'disabled'}`）：
+    // 让"没调模型 / 调了但降级"在响应里可判定，而不是靠日志猜。
+    suggestion_llm: suggestionLlm,
     limits: {
       max_chars: NICKNAME_MAX_CHARS,
       max_gbk_bytes: NICKNAME_MAX_GBK_BYTES,
       collect_max_chars: NICKNAME_COLLECT_MAX_CHARS,
     },
-    // 显式声明本路径未调用模型（"离线可捕获"的可判定证据）。
-    model_called: false,
+    // 显式声明**本路径是否真的调了模型**（模型增强默认关闭 ⇒ 恒 false）。
+    model_called: !!(suggestionLlm && suggestionLlm.called),
   };
 }
 
-// POST /game/nickname/extract —— 纯规则抽取 + G-N1 校验（**只读、不落库、不调模型**）
-gameRouter.post('/game/nickname/extract', (req, res) => {
+// POST /game/nickname/extract —— 规则抽取 + G-N1 校验（**只读、不落库**；
+//   模型增强**默认关闭**，仅 NICKNAME_SUGGEST_LLM=1 时启用，且失败/超时静默回落）
+gameRouter.post('/game/nickname/extract', async (req, res) => {
   const raw = req.body?.text;
   if (raw === undefined || raw === null) {
     return res.status(400).json({ ok: false, error: 'text 不能为空' });
@@ -2023,10 +2113,10 @@ gameRouter.post('/game/nickname/extract', (req, res) => {
   if (text.length > 500) {
     return res.status(400).json({ ok: false, error: 'text 过长（>500）' });
   }
-  // npc 可选：仅用于"兜底池按角色取措辞风格"；缺省或不认识的角色 ⇒ 只走机械派生。
+  // npc 可选：仅用于"兜底池按角色取"（三人池各不相同）；缺省或不认识的角色 ⇒ 只走离线派生。
   const c = req.body?.npc ? findCompanion(req.body.npc) : null;
   const roleKey = c ? findRoleKeyByName(c.name) : null;
-  return res.json(renderNicknameExtraction(text, roleKey));
+  return res.json(await renderNicknameExtraction(text, roleKey));
 });
 
 // POST /game/nickname/set —— 落库（**只经唯一写入口 setCompanionNickname**）

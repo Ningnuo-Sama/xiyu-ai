@@ -190,7 +190,7 @@ function classify(p) {
   if (/white|ambient|onscreen|presence|encounter/.test(joined)) return 'white';
   return 'chat';
 }
-const isDeclaration = (p) => /forbidden_address|disallow|banned|禁用|rule_reading|self_describe|_meta/.test(p);
+const isDeclaration = (p) => /forbidden_address|disallow|banned|禁用|rule_reading|self_describe|_meta|candidate_pool/.test(p);
 /**
  * 三词领地（老地方/别迟到/照旧）的**声明容器**判定 —— t54 收窄口径（t53 F-5）：
  * 只有 `fingerprint.territory_boundary*`（"禁止越界使用"清单）与 `fingerprint.distinct_from.*`

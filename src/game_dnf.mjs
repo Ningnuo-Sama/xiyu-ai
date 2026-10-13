@@ -18,15 +18,28 @@ import { Router } from 'express';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
-import { getDb, parseCompanionRow } from './db.mjs';
+import { getDb, parseCompanionRow, setCompanionNickname, getCompanionNicknameState } from './db.mjs';
 import { playgroundChat } from './playground.mjs';
 import { buildSystemPrompt } from './companion.mjs';
 import { generateReply } from './ai.mjs';
+// t127：称呼抽取/校验是**纯规则纯函数**（不调模型）——端点直接复用，Go 侧不再实现第二份。
+import {
+  extractNicknameCandidate,
+  validateNicknameCandidate,
+  NICKNAME_MAX_CHARS,
+  NICKNAME_MAX_GBK_BYTES,
+  NICKNAME_COLLECT_MAX_CHARS,
+} from './nickname_gate.mjs';
 
 export const gameRouter = Router();
 
-// 超时门限：4.0秒内未完成则快速熔断切本地，既给在线大模型充足生成时间，又符合真人打字延迟（“对方正在输入中…”）
-const CHAT_TIMEOUT_MS = Number(process.env.CHAT_API_TIMEOUT_MS || 4000);
+// 超时门限（用户 2026-10-13 裁定，恢复 2026-10-07 已定口径）：15~20 秒内未完成才降级切本地。
+//   旧值 4 秒是后来新链路回退时被误带的——它会让慢模型/冷启动白白降级：
+//   钱花了、AI 回复被丢掉、玩家看到的却是本地兜底。
+// ⚠️ 明确不加任何垫话（用户否决「嗯……/等下/稍等」类占位消息）：超时即**整条**走本地兜底。
+// ⚠️ 不变量：前台（Go 侧）等待必须 **严格大于** 本值，否则前台先放弃、这里的 20s 形同虚设。
+//   见 dnf-robot-act12/internal/capability/lover/client.go 的 brainChatTimeoutDefault 注释与编译期门禁。
+const CHAT_TIMEOUT_MS = Number(process.env.CHAT_API_TIMEOUT_MS || 20000);
 
 // ── 0. `source` 取值契约（与 Go 侧对齐；改动前先读这段） ───────────────────────
 /**
@@ -79,6 +92,77 @@ export function normalizeSource(value) {
   if (SOURCE_VALUES.has(v)) return v;
   log('warn', `[Game] 未知 source "${v}" → 按 ${SOURCE.API_FALLBACK} 降级处理（契约见 SOURCE 常量表）`);
   return SOURCE.API_FALLBACK;
+}
+
+// ── 0.0a `intent` 取值域冻结（t113） ─────────────────────────────────────────
+/**
+ * `intent` 是**大脑回复体里新增的机器可读字段**（Go 侧 AI 判定的唯一来源）：
+ *
+ *   intent: { end_of_conversation: bool | null, reason: string }
+ *
+ * ## 三条硬约定（t113 captain 裁定，勿改）
+ *
+ * 1. **`source` 不由 LLM 自证**：本字段**不含** `source`；即便将来有人往里塞，Go 侧
+ *    **也不得以它为判据**。来源必须由**消费方**（Go）在消费处赋值——来源谎报会同时
+ *    毁掉埋点与回放。
+ *
+ * 2. **`null` 与 `false` 语义严格可分**，消费端处置不同：
+ *    · `end_of_conversation === false` ⇒ **LLM 判过了，结论是"不是告别"**（可入埋点/日志）；
+ *    · `end_of_conversation === null`  ⇒ **没判出来（未判定）** ⇒ Go 侧**零行为变化**
+ *      （维持现状 = 与今天完全一致）。
+ *    ⚠️ 本环境**无任何可用模型**，故当前**所有分支都只能产出 `null`**——这是如实反映
+ *    "plumbing 已接、判定未启用"，**不是**把"未判定"伪装成"判定结果"。
+ *
+ * 3. **没有"回本地规则"这一支**：Go 侧**从未实现**本地告别判定（t112 只读实测：
+ *    `internal/` 全域 0 命中，只有 `lover_test_port.go` 的 `Wired:false` 占位）。
+ *    因此"LLM 不可用 ⇒ 无判定"就是完整的降级语义，**不得**写成"回本地规则"。
+ *
+ * ## reason 取值域（封闭枚举，勿增未登记值）
+ *   · `OTHER`     —— 判过了、但结论不属于"结束对话"这一类（配合 false 使用）
+ *   · `ENDING`    —— 判过了、结论是"会话结束"（配合 true 使用）
+ *   · `parse_failed` —— 结构化输出解析失败 ⇒ 没判出来（配合 null）
+ *   · `degraded`     —— 在线路径不可用 / 无模型 ⇒ 没判出来（配合 null）
+ *   · `timeout`      —— 判定超时 ⇒ 没判出来（配合 null）
+ */
+export const INTENT_REASONS = {
+  OTHER: 'OTHER',
+  ENDING: 'ENDING',
+  PARSE_FAILED: 'parse_failed',
+  DEGRADED: 'degraded',
+  TIMEOUT: 'timeout',
+};
+
+/** 未判定的唯一构造点：所有"没判出来"的分支都必须走它，避免手写散落。 */
+export function noJudgmentIntent(reason) {
+  return { end_of_conversation: null, reason: String(reason || INTENT_REASONS.DEGRADED) };
+}
+
+/**
+ * 有判定结果时用它构造（当前**无调用方**：本环境无模型 ⇒ 走不到这里）。
+ *
+ * 保留它是为了让"将来接上模型"只需在取值处替换，而**不必再改任何 return 点**——
+ * 全部 return 点已经统一经 `intentOfBurst()` 带字段，见下面的统一包装。
+ */
+export function judgedIntent(endOfConversation, reason) {
+  return {
+    end_of_conversation: !!endOfConversation,
+    reason: String(reason || (endOfConversation ? INTENT_REASONS.ENDING : INTENT_REASONS.OTHER)),
+  };
+}
+
+/**
+ * **单一出口统一包装**（t113 硬要求）：把 intent 挂到 burst 上。
+ *
+ * 为什么挂在 burst 上：`/game/chat` 的 4 个响应分支里，有 3 个是
+ * `replies: burst.replies, …` 直接摊开 burst 的——若 intent 挂在别处，
+ * 这些分支就会"不带字段"。挂在 burst 上 ⇒ 3 个分支**自动**带字段；
+ * 剩下 1 个睡眠分支（`replies: []`，不经过 burst）单独补。
+ *
+ * @param {object} burst `chunkToBursts` 的返回值
+ * @param {object} [intent] 省略即"未判定"（当前必然如此：无模型）
+ */
+export function intentOfBurst(burst, intent) {
+  return Object.assign({}, burst, { intent: intent || noJudgmentIntent(INTENT_REASONS.DEGRADED) });
 }
 
 // ── 0.0 `source_reason` 取值域冻结（t13 F-3 / F-6） ──────────────────────────
@@ -1272,7 +1356,8 @@ export function sanitizeEmojiToGBK(text) {
 
 export function chunkToBursts(rawText) {
   const sanitized = sanitizeEmojiToGBK(rawText).trim();
-  if (!sanitized) return { replies: ['在呢在呢~'], delays_ms: [1000], overflow_mail: null };
+  // t113：早退分支也必须带 intent（本环境无模型 ⇒ 未判定）。走 intentOfBurst 统一包装。
+  if (!sanitized) return intentOfBurst({ replies: ['在呢在呢~'], delays_ms: [1000], overflow_mail: null });
 
   // 按换行、句号、感叹号、问号切分为候选句子
   const parts = sanitized.split(/(?<=[。！？!\?\n~])/).map(s => s.trim()).filter(Boolean);
@@ -1316,7 +1401,9 @@ export function chunkToBursts(rawText) {
     };
   }
 
-  return { replies, delays_ms, overflow_mail };
+  // t113：主路径同样经统一包装带 intent。**判定值将来只在这里替换**——
+  // 4 个 HTTP 响应分支都不再各自写 intent，避免"有的分支漏字段"。
+  return intentOfBurst({ replies, delays_ms, overflow_mail });
 }
 
 // ── POST /game/chat：1:1 私聊（API 优先，1.5s 超时瞬间退本地） ───────────────
@@ -1343,6 +1430,8 @@ gameRouter.post('/game/chat', async (req, res) => {
       replies: burst.replies,
       delays_ms: burst.delays_ms,
       overflow_mail: burst.overflow_mail,
+      // t113：intent 随 burst 统一携带（此分支是"本地洗牌袋直出"，无 LLM 判定）。
+      intent: burst.intent,
       sleeping: false,
       mood: c.current_mood,
       affection: c.affection_level,
@@ -1390,6 +1479,9 @@ gameRouter.post('/game/chat', async (req, res) => {
       replies: [],
       delays_ms: [],
       overflow_mail: null,
+      // t113：本分支**不经过 burst**（空回复），故单独补 intent —— 否则这里会成为
+      // "有的分支没带字段"的隐式空洞。睡眠 = 未生成任何内容 ⇒ 未判定。
+      intent: noJudgmentIntent(INTENT_REASONS.DEGRADED),
       sleeping: true,
       mood: c.current_mood,
       affection: c.affection_level,
@@ -1415,6 +1507,9 @@ gameRouter.post('/game/chat', async (req, res) => {
       replies: burst.replies,
       delays_ms: burst.delays_ms,
       overflow_mail: burst.overflow_mail,
+      // t113：intent 随 burst 统一携带。**当前恒为"未判定"**（本环境无模型），
+      // 故即便这里是 LLM 在线成功的分支，也不得声称"LLM 判过了"。
+      intent: burst.intent,
       sleeping: false,
       // ★ P0-A：状态即时化。playgroundChat 已把 syncUpdateCompanionState 提到响应之前
       // 同步执行，所以 onlineResult.state 就是本次生成后的最新值。原实现用 c.* 兜底，
@@ -1452,6 +1547,9 @@ gameRouter.post('/game/chat', async (req, res) => {
     replies: burst.replies,
     delays_ms: burst.delays_ms,
     overflow_mail: burst.overflow_mail,
+    // t113：本分支是"在线失败 → 回落本地语料"（source=local）。退回本地语料
+    // **不代表**做了告别判定 ⇒ intent 仍是"未判定"。
+    intent: burst.intent,
     sleeping: false,
     mood: c.current_mood,
     affection: c.affection_level,
@@ -1527,8 +1625,10 @@ gameRouter.post('/game/mail', async (req, res) => {
       '严禁出现现代词汇或不可交易道具。',
     ].filter(Boolean).join('\n');
 
+    // 与私聊共用同一超时预算。此前这里是**硬编码 3000ms**，与 CHAT_TIMEOUT_MS 分叉，
+    // 导致同一个大脑上有两套降级口径（t85 一并核对并统一）。
     const timeoutPromise = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error('API_TIMEOUT')), 3000)
+      setTimeout(() => reject(new Error('API_TIMEOUT')), CHAT_TIMEOUT_MS)
     );
 
     const safeGenerate = generateReply(personaPrompt, [], instruction, { max_tokens: 400 },
@@ -1623,5 +1723,365 @@ gameRouter.post('/game/mail', async (req, res) => {
     source: normalizeSource(source),
     // t13 F-3：同样只放枚举；原始 provider 错误串留在服务端日志，不入响应体。
     ...(failureSink.failed ? { source_reason: SOURCE_REASONS.LLM_FAILED } : {}),
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 称呼采集三端点（t127，供 Go 侧调用；**加法**，不改既有端点语义）
+//
+// ## 为什么必须由大脑侧出端点，而不是让 Go 侧自己判
+// 抽取与门禁已在大脑侧落地（`nickname_gate.mjs`，纯规则）。**Go 侧不得再实现一份**
+// ——两份实现必然漂移（规则线刚吃过这个教训：JS 标尺全绿证不了 Go 行为）。
+// ⇒ Go 只负责"问 / 收 / 转发 / 渲染"，判定唯一在本文件背后的纯函数里。
+//
+// ## 三条硬约束（t127 契约）
+//   1. **不调用任何模型**：三条路径全是纯规则函数（`extractNicknameCandidate` /
+//      `validateNicknameCandidate`），**无 Key 也能用**——这是"离线可捕获"的实现前提。
+//   2. **不绕过 G-N1**：写路径**只经** `setCompanionNickname`（唯一写入口），
+//      校验→写入的机械顺序由 db.mjs 保证（直调 `upsertShaping(kind='nickname')` 仍抛错）。
+//   3. **返回体可判定**：抽取三态 + 每个候选的门禁结论（`gate.ok` / `gate.code`）
+//      逐项可读；错误响应沿用既有 `{ok:false,error}` + 400/404 风格，**不伪装成成功**。
+//
+// ## 行/列返回形状
+//   POST /game/nickname/extract（只读，**不落库**）
+//     { ok, kind:'accepted'|'rejected_named'|'unparsed', reason,
+//       candidates:[{ text, chars, bytes, gate:{ ok, code?, detail? }, via? }],
+//         // via 是**回执**：仅当 gate.ok 时下发，Go 原样回传给 /set 作凭证
+//       candidate:{...}|null,      // 首个候选的便捷视图
+//       will_persist:bool,         // **可落库** == kind==='accepted' && candidate.gate.ok
+//       action:'persist'|'ask_again'|'offer_candidates'|'declined'|'retry',
+//       limits:{ max_chars, max_gbk_bytes, collect_max_chars }, model_called:false }
+//   POST /game/nickname/set（写；**必须带规则抽取产出的 candidate**）
+//     { ok:true, text, nickname_state:{...} } | 400 { ok:false, error, code? }
+//   GET  /game/nickname/state?npc=&user_id=
+//     { ok:true, nickname_state:{...}, model_called:false }
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 「太长 ⇒ 给候选」（t129）
+//
+// ## 为什么是"机械派生"而不是"编名字"
+// 设计 §2.7 要求"太长时必须给 2~3 个候选"，但**凭空造句**会让玩家看到一个
+// 与她/他毫无关系的名字。故本实现只做**可复述、可单测**的机械派生：
+//   给定过长候选 c（7~8 字）：
+//     ① 前缀 2 字：c.slice(0,2)        （"abcdefg" → "ab"）
+//     ② 首字叠用：c[0] + c[0]          （"abcdefg" → "aa"）
+//     ③ 单字：    c[0]                  （"abcdefg" → "a"）
+//   去重后**保留顺序**，最多 3 条。
+// **不做的**：不拼后缀（"宝/儿/子"这类甜称呼会踩人设禁忌）、不做音译、不造句。
+//
+// ## 每条候选必须"自己过自己的门禁"
+// 这是本任务最容易出荒谬态的地方：**她给出一个她自己都不收的名字**。
+// 故每条候选都要**原样回灌** `extractNicknameCandidate` 再 `validateNicknameCandidate`
+// ——不是"我确信它会过"，而是**让它真的过一次**（与 G-N1 同一判定，零第二套实现）。
+// 过不了的一律剔除；全被剔除则 `suggestions: []`。
+//
+// ## 与兜底池（t130）协作：**只消费、不硬编码键名**
+// 池的语料键名由 t130 定稿 ⇒ 本文件**不写死任何一个键**，而是：
+//   · 优先读 `NICKNAME_SUGGEST_POOL_KEY`（t130 定稿后由配置指过去，一行配置即接上）；
+//   · 否则按候选名探测（`nickname_suggestions` / `exonym_pool` / …），命中即用；
+//   · 都拿不到 ⇒ **纯派生**，**绝不报错**（缺池是正常态，不是故障）。
+// 响应里回显 `pool_key`（命中键名或 null）⇒ 键名漂移会**在测试里显形**，而不是静默失效。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** 名称 → 语料 roleKey（peach/tuanzi/heika）。口径与既有 roleKey 判定一致，避免同一角色被定成不同的人。 */
+function findRoleKeyByName(name) {
+  const n = String(name || '');
+  if (n.includes('团子')) return 'tuanzi';
+  if (n.includes('黑咖') || n.includes('助手')) return 'heika';
+  return 'peach';
+}
+
+/**
+ * 派生条数上限（生产默认 **3**）。
+ *
+ * ⚠️ **这不是产品可调参数，而是"池补位"路径的测试钩子**（与 `photo_planner.mjs` 的
+ * `PHOTO_TEST_HOUR` 同一惯例：**仅当显式设置才生效，生产不设**）。
+ *
+ * 为什么需要它：派生规则对"过长候选"恒产出 3 条不同文本（前缀2字 / 首字叠用 / 单字），
+ * 而 `max` 也是 3 ⇒ **池补位分支在生产输入下永远走不到**。t129 我如实上报了"不可达"，
+ * captain 裁定「**不可达 ≠ 可以不测**」（F-31 生产死代码的教训）：**用 fixture 把它打通并测掉**。
+ * 故这里留一个**只影响派生条数**的窄口子：测试把它设成 1，池补位路径即可被真正执行与断言。
+ *
+ * 另外明确一条口径：**不得为了"让池出场"而把生产默认改小**（那是为了让测试好看而改产品行为）；
+ * 派生来自玩家自己的输入（更 personal）⇒ **派生优先是正确的**，池是安全网。
+ */
+const NICKNAME_MAX_DERIVED = Math.max(1, Number(process.env.NICKNAME_MAX_DERIVED || 3));
+
+/**
+ * 兜底池的语料键名 —— **由 t130 定稿，本文件不得另起一个名字**。
+ *
+ * 键名漂移是本项目吃过亏的老问题（"两边各写一个键名"⇒ 静默失效），
+ * 故这里**只认这一个键**，且用"另一份键名清单"做探测是**被刻意去掉的**。
+ * 想换键名时改这里一处（或用 env 覆盖，便于测试注入与将来的灰度）。
+ */
+const NICKNAME_POOL_KEY = 'naming.nickname_candidate_pool';
+
+/** 该键可能落在哪些命名语料文件里（按序探测；都不存在 ⇒ 无池，**不是错误**）。 */
+const NICKNAME_POOL_CORPUS_CANDIDATES = ['naming', 'peach', 'tuanzi', 'heika'];
+
+/** 已探到的池位置缓存（**只缓存"找到了"**；未找到不缓存）。 */
+let _nicknamePoolLocation = null;
+
+/**
+ * 按「env 覆盖 → 命名语料文件」定位兜底池；取不到返回 null（**不是错误**）。
+ *
+ * ⚠️ **不缓存"没找到"**（t129 实测踩到）：若把"未命中"也缓存成 null，则**池是后加的**
+ * 情形（t130 先交付代码、语料随后落盘 / 热更新增池文件）在**进程不重启**时永远探不到——
+ * 表现为"语料加了但端点一直说没池"，且**不报错**（最坏的那种静默失效）。
+ * 负结果不缓存 ⇒ 下一个请求会重新探测；而探测本身走 `loadCorpusHot`（有 mtime 缓存），
+ * 代价只是几次 stat，可接受。
+ */
+function resolveNicknamePoolKey() {
+  const explicit = String(process.env.NICKNAME_SUGGEST_POOL_KEY || '').trim();
+  // ⚠️ 返回值**形状必须统一**为 `{corpus, key}`：env 覆盖给的是一段文本（既当 corpus 名、
+  // 也当返回给调用方的键名），不能直接返回字符串——否则下游读 `loc.key` 会得到 undefined，
+  // 表现为"池读到了、键名却丢了"（t129 实测踩到，且**不报错**）。`key` 一律取用户给的名字。
+  if (explicit) return { corpus: explicit, key: explicit };
+  // ⚠️ 缓存的**命中**也要复核仍然成立（t132 实测踩到）：若只信缓存，则池文件被**删除/改名**
+  // 之后仍会声称"池在这儿"（`pool_key` 回显非 null、items 却是空），又是一种静默失效。
+  // 正确做法：缓存只用来**跳过探测顺序**，命中成立与否仍以"当前能读出来"为准。
+  if (_nicknamePoolLocation) {
+    const cached = loadCorpusHot(_nicknamePoolLocation.corpus);
+    if (cached && pickStringArrayAt(cached, _nicknamePoolLocation.key).length) return _nicknamePoolLocation;
+    _nicknamePoolLocation = null;   // 缓存已失效 ⇒ 清掉后重新探测
+  }
+  for (const name of NICKNAME_POOL_CORPUS_CANDIDATES) {
+    const parsed = loadCorpusHot(name);   // 不存在 ⇒ null（不抛）
+    if (parsed && pickStringArrayAt(parsed, NICKNAME_POOL_KEY).length) {
+      _nicknamePoolLocation = { corpus: name, key: NICKNAME_POOL_KEY };
+      return _nicknamePoolLocation;
+    }
+  }
+  return null;
+}
+
+/** 按 `{corpus,key}` 或裸键名取池候选；读不到 ⇒ 空数组（**不抛**）。 */
+function loadNicknameSuggestionPool(roleKey) {
+  const loc = resolveNicknamePoolKey();
+  if (!loc) return { key: null, items: [] };
+  // 形状已统一为 `{corpus,key}`（见 resolveNicknamePoolKey），此处不再分支处理字符串。
+  const parsed = readPoolJson(loc.corpus);
+  if (parsed === null) return { key: loc.key, items: [] };
+  const scoped = roleKey ? pickStringArrayAt(parsed, `${loc.key}.${roleKey}`) : [];
+  const items = scoped.length ? scoped : pickStringArrayAt(parsed, loc.key);
+  return { key: loc.key, items };
+}
+
+/** 从已解析的 JSON 里按点路径取字符串数组；形状不对返回 []（**不抛**）。 */
+function pickStringArrayAt(node, dottedPath) {
+  let cur = node;
+  for (const seg of String(dottedPath).split('.')) {
+    if (cur === null || typeof cur !== 'object') return [];
+    cur = cur[seg];
+  }
+  if (!Array.isArray(cur)) return [];
+  return cur.filter((x) => typeof x === 'string' && x.trim() !== '').map((x) => x.trim());
+}
+
+/** 读取池 JSON（`name` 既可能是语料名如 `peach`，也可能是**文件名**如 `nickname_suggestions`）。 */
+function readPoolJson(name) {
+  // ⚠️ 语料名**不能**靠正则剥掉 `_corpus` 后缀来识别（t132 实测踩到）：`loc.corpus` 本身
+  // 就是 `peach` 这种**不带后缀**的名字，正则匹配不上 ⇒ 退到"读 peach.json"⇒ 文件不存在
+  // ⇒ 返回 null ⇒ **池键名解析成功、条目却是空的**（`poolKey` 非 null 但 `items:[]`）。
+  // 那种"半成功"最容易骗过断言（键名对了就以为池通了），故这里改成**直接让 loadCorpusHot 拼**。
+  const asCorpus = loadCorpusHot(name);
+  if (asCorpus !== null) return asCorpus;
+  try {
+    const p = path.join(CORPUS_DIR, `${name}.json`);
+    if (!fs.existsSync(p)) return null;
+    return JSON.parse(fs.readFileSync(p, 'utf-8'));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 把"一个纯字符串"还原成**经门禁验证的**候选对象（回灌 extractor，不用第二套判定）。
+ * 过不了 ⇒ null（调用方剔除）。返回对象带 `via` 回执 ⇒ 上层可原样回传给 `/set`。
+ */
+function validatedSuggestionFromText(text) {
+  const ex = extractNicknameCandidate(String(text ?? ''));
+  if (ex.kind !== 'accepted' || !ex.candidates.length) return null;
+  const cand = ex.candidates[0];
+  const gate = validateNicknameCandidate(cand);
+  if (!gate.ok) return null;
+  return { text: cand.text, chars: [...String(cand.text)].length, bytes: gbkByteLength(cand.text), gate: { ok: true }, via: cand.via };
+}
+
+/**
+ * 为"过长候选"生成建议：**派生优先 → 池补足 → 都没有就空数组**。
+ * 每条都**真的过了一次 G-N1**（`validatedSuggestionFromText`），并标 `source`。
+ */
+function buildNicknameSuggestions(longText, roleKey, max = 3) {
+  const c = String(longText ?? '');
+  const chars = [...c];
+  const derivedTexts = [];
+  if (chars.length >= 2) derivedTexts.push(chars.slice(0, 2).join(''));   // ① 前缀 2 字
+  if (chars.length >= 1) derivedTexts.push(chars[0] + chars[0]);          // ② 首字叠用
+  if (chars.length >= 1) derivedTexts.push(chars[0]);                     // ③ 单字
+
+  const items = [];
+  const seen = new Set();
+  const push = (text, source) => {
+    if (items.length >= max) return;
+    const v = validatedSuggestionFromText(text);
+    if (!v) return;                    // 过不了门禁的候选一律不出现
+    if (seen.has(v.text)) return;      // 去重（按**门禁后的**文本）
+    seen.add(v.text);
+    items.push({ ...v, source });
+  };
+
+  // ① 派生优先：取前 N 条派生（N 默认 3；测试可用 NICKNAME_MAX_DERIVED 压到 1，见该常量注释）
+  for (const t of derivedTexts.slice(0, NICKNAME_MAX_DERIVED)) push(t, 'derived');
+  // ② 池补足：**总是尝试**读取兜底池，以便如实回显命中的键名（键名漂移要能显形）。
+  //    `push` 内部有 `max` 上限 ⇒ 派生已占满时池条目自然落不进来，"派生优先"不被破坏；
+  //    派生不足 3 条时才真正轮得到池（缺池 ⇒ items 空 ⇒ 纯派生，**不报错**）。
+  const pool = loadNicknameSuggestionPool(roleKey);
+  for (const t of pool.items) push(t, 'pool');
+  return { items, poolKey: pool.key };
+}
+
+/** 把一次抽取结果渲染成 Go 可直接分支的形状（纯函数，不落库）。 */
+function renderNicknameExtraction(rawText, roleKey = null) {
+  const extracted = extractNicknameCandidate(rawText);
+  const candidates = (extracted.candidates || []).map((cand) => {
+    const gate = validateNicknameCandidate(cand);
+    return {
+      text: cand.text,
+      chars: [...String(cand.text)].length,
+      bytes: gbkByteLength(cand.text),
+      gate: gate.ok ? { ok: true } : { ok: false, code: gate.code, detail: gate.detail },
+      // ⚠️ 回执（via）**只在候选真的过了 G-N1 时**才下发：Go 把它原样回传给
+      // `/game/nickname/set` 作为"该候选来自规则抽取"的凭证。
+      // 过不了门禁的候选（如 7 字 over_window）**不发凭证** ⇒ 它天然写不进去，
+      // 也就不存在"先拿到手再绕过门禁"的缝隙。
+      ...(gate.ok ? { via: cand.via } : {}),
+    };
+  });
+  const candidate = candidates[0] || null;
+  const willPersist = extracted.kind === 'accepted' && !!candidate && candidate.gate.ok;
+
+  let action;
+  let reason = extracted.reason ?? null;
+  if (extracted.kind === 'accepted') {
+    if (candidate.gate.ok) {
+      action = 'persist';
+    } else if (candidate.gate.code === 'over_window' || candidate.gate.code === 'chars_exceeded') {
+      // 7~8 字（采集窗内、落库上限外）：走"自然换说法 + 给候选"，**不落库**。
+      action = 'offer_candidates';
+    } else {
+      action = 'ask_again';
+    }
+  } else {
+    action = extracted.kind === 'rejected_named' ? 'declined' : 'retry';
+  }
+  if (extracted.kind === 'accepted' && candidate && !candidate.gate.ok && !reason) {
+    reason = candidate.gate.code;
+  }
+
+  // t129：只有"太长 ⇒ 给出路"这一支才产生建议。其他分支一律空数组
+  //（正常/未解析/拒答都不该被塞候选——那会把"再问一次"变成"替你决定"）。
+  let suggestions = [];
+  let suggestionPoolKey = null;
+  if (action === 'offer_candidates' && candidate && candidate.text) {
+    const built = buildNicknameSuggestions(candidate.text, roleKey);
+    suggestions = built.items;
+    suggestionPoolKey = built.poolKey;
+  }
+
+  return {
+    ok: true,
+    kind: extracted.kind,
+    reason,
+    candidates,
+    candidate,
+    will_persist: willPersist,
+    action,
+    // t129：「太长时给候选」——每条都**自身过了 G-N1**，并标 source='derived'|'pool'。
+    // Go 侧可直接把 `suggestions[i]`（含 via 回执）原样回传给 /set。
+    suggestions,
+    // 回显命中的池键名（未命中为 null）⇒ 键名漂移在测试里显形，而不是静默失效。
+    suggestion_pool_key: suggestionPoolKey,
+    limits: {
+      max_chars: NICKNAME_MAX_CHARS,
+      max_gbk_bytes: NICKNAME_MAX_GBK_BYTES,
+      collect_max_chars: NICKNAME_COLLECT_MAX_CHARS,
+    },
+    // 显式声明本路径未调用模型（"离线可捕获"的可判定证据）。
+    model_called: false,
+  };
+}
+
+// POST /game/nickname/extract —— 纯规则抽取 + G-N1 校验（**只读、不落库、不调模型**）
+gameRouter.post('/game/nickname/extract', (req, res) => {
+  const raw = req.body?.text;
+  if (raw === undefined || raw === null) {
+    return res.status(400).json({ ok: false, error: 'text 不能为空' });
+  }
+  const text = String(raw);
+  if (text.length > 500) {
+    return res.status(400).json({ ok: false, error: 'text 过长（>500）' });
+  }
+  // npc 可选：仅用于"兜底池按角色取措辞风格"；缺省或不认识的角色 ⇒ 只走机械派生。
+  const c = req.body?.npc ? findCompanion(req.body.npc) : null;
+  const roleKey = c ? findRoleKeyByName(c.name) : null;
+  return res.json(renderNicknameExtraction(text, roleKey));
+});
+
+// POST /game/nickname/set —— 落库（**只经唯一写入口 setCompanionNickname**）
+gameRouter.post('/game/nickname/set', (req, res) => {
+  const npc = req.body?.npc;
+  const candidate = req.body?.candidate;
+  const rawMsg = req.body?.raw_msg ?? null;
+  const userId = req.body?.user_id ?? null;
+
+  if (!candidate || typeof candidate !== 'object' || typeof candidate.text !== 'string') {
+    // 缺证书形态：直接拒（不伪装成"她没听懂"，那是另一回事）
+    return res.status(400).json({
+      ok: false,
+      error: 'candidate.text 必填；且 candidate 必须是 /game/nickname/extract 返回的规则抽取结果',
+    });
+  }
+  const c = findCompanion(npc);
+  if (!c) return res.status(404).json({ ok: false, error: `恋人 NPC 不存在: ${npc}` });
+
+  const out = setCompanionNickname({
+    companionId: c.id,
+    candidate: { text: candidate.text, via: candidate.via },
+    rawMsg,
+  });
+  if (!out.ok) {
+    // 门禁拒绝 ⇒ 400 + **原样透出拒绝码**（Go 侧据此决定"再问一次 / 给候选 / 换说法"）。
+    // 一处诊断增强（不改门禁语义）：若调用方给的是"结构合法但**没带回执**"的候选
+    // （`text` + 来自抽取端的 tags，但缺 `via`），说明它多半是 extract 阶段被判
+    // over_window/chars_exceeded **因此没发回执** 的那类候选 ⇒ 附带提示，让 Go 不必猜。
+    const hint = (out.code === 'not_rule_extracted' && candidate.text)
+      ? '该候选未携带回执（via）：/game/nickname/extract 只对**过了 G-N1 的候选**下发回执；' +
+        '若它来自本端点却被拒，多半是 over_window / chars_exceeded（未发回执，故不可落库）'
+      : undefined;
+    return res.status(400).json({ ok: false, error: out.detail || out.code, code: out.code, ...(hint ? { hint } : {}) });
+  }
+  return res.json({
+    ok: true,
+    text: out.text,
+    nickname_state: getCompanionNicknameState(c.id, { userId }),
+  });
+});
+
+// GET /game/nickname/state —— 读称呼与"按账号只问一次"状态（**只读**）
+gameRouter.get('/game/nickname/state', (req, res) => {
+  const npc = req.query?.npc;
+  const rawUserId = req.query?.user_id;
+  const userId = rawUserId === undefined || rawUserId === '' ? null : Number(rawUserId);
+  if (rawUserId !== undefined && rawUserId !== '' && !Number.isFinite(userId)) {
+    return res.status(400).json({ ok: false, error: 'user_id 必须是数字' });
+  }
+  const c = findCompanion(npc);
+  if (!c) return res.status(404).json({ ok: false, error: `恋人 NPC 不存在: ${npc}` });
+  return res.json({
+    ok: true,
+    nickname_state: getCompanionNicknameState(c.id, { userId }),
+    model_called: false,
   });
 });

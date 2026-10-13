@@ -702,14 +702,43 @@ const KEY_PATHS_PENDING_READER = [
   { path: 'social.followup', kind: 'tieredStringArray', note: '追问三档（continue_topic / share / discuss）；读者=待实现的追问链路（t66）' },
   { path: 'social.farewell', kind: 'stringArray', note: '告别收尾语；读者=待实现的告别识别' },
   { path: 'social.silence_note', kind: 'stringArray', note: '§21.5 静默期「她还在」信号（每 7 天 ≤1 封）；读者=待实现的静默投递' },
+  // ── t125（t120 收尾）：一期三事件的 5 个新键（设计稿 `账号级身份与称呼采集设计-2026-10-13.md` §6.2）──
+  //   ⚠️ 键名**沿用既有 `naming.*` 体系**（不新立 `lover.*` 第二套；纪律 4「不新立第二套体系」）。
+  //   ⚠️ `alias`：某角色的本格语义由**既有键**承担时，**显式登记别名**（指向该既有键），
+  //      **不复制语义重复的条目**（登记的目的是"防误删/防清空"，不是"凑齐形状"）。
+  { path: 'naming.first_meet_elvenguard', kind: 'stringArray', note: '首见·艾尔文防线（账号首个角色；仅桃子必须投，团子/黑咖预留）；设计 §6.2/§3；读者=待实现的首见事件' },
+  { path: 'naming.alt_first_login', kind: 'stringArray', note: '小号首登（同账号第 2+ 角色识别）；设计 §6.2/§4；读者=待实现的小号识别事件' },
+  { path: 'naming.nickname_confirm', kind: 'stringArray', note: '称呼确认（复述候选 + 最小确认）；设计 §6.2/§2.4；读者=待实现的命名事件写入端（backlog B-1）',
+    alias: { tuanzi: 'naming.nickname_accept' },
+    aliasNote: '团子：本格语义由既有 `naming.nickname_accept` 承担（**同语义、不复制条目**）——该别名在此**显式登记**，不得静默缺失' },
+  { path: 'naming.nickname_too_long', kind: 'stringArray', note: '称呼过长：自然换说法 + 给出路 + 给 2~3 个候选；设计 §6.2/§2.4/§2.7；读者=待实现的命名事件写入端（B-1）' },
+  { path: 'naming.nickname_change', kind: 'stringArray', note: '改称呼（"以后叫我 X"）；设计 §6.2/§2.5；读者=待实现的命名事件写入端（B-1）' },
+  // ── t130：称呼"太长"时的**兜底候选池**（t129 的姊妹件）／t131 复核修正 ──
+  //   ⚠️ **键名由 t130 定稿 = `naming.nickname_candidate_pool`**；**t129 的端点侧派生候选必须用同一键名**，勿另起（防键名漂移）。
+  //   内容口径：三人各 **4 条"可当称呼用的短名"**（她拿来叫玩家，**不是寒暄句**）。
+  //   🔴 **t131 更正（重要）**：池内每条是否合规，**必须以「门禁本体逐条复核」为准** ——
+  //     调用 `src/nickname_gate.mjs` 的 **`extractAndValidateNickname(条目)`**（或 `validateNicknameCandidate`，但后者**要求入参是抽取产出的对象**，
+  //     传裸字符串会一律得到 `not_rule_extracted` ⇒ **裸串直传不是有效复核**）。
+  //     **t130 曾以"自写检查"断言"池内每条都自身过了 G-N1"，实测是错的**：`甜甜~` 被门禁本体判 `unparsed/forbidden_punctuation_or_space`（ASCII `~` 属标点）。
+  //     ⇒ **自写检查 ≠ 门禁本体**（自写检查只覆盖了长度/字节/枚举禁用词，**没覆盖"标点/空白残留"类规则**）⇒ 又一次"两份实现必然漂移"的实例。
+  //     t131 已把该条换为 `小糖球`，并用门禁本体复核 **12/12 PASS**（PEACH：小甜甜/糖糖/小糖球/阿糖）。
+  //   ⚠️ **运行时**从池取候选，**仍须逐条再过一次 `extractAndValidateNickname`**（池的合规是**当时快照**，不是永久保证）；不过则丢弃并继续取。
+  //   指纹承载：桃子=甜点叠字系（**不带 `~`**）｜团子=嫌弃向外号（无句号）｜黑咖=理科记录腔（人设卡外号池词汇）；与 t120 的 42 条不重复。
+  { path: 'naming.nickname_candidate_pool', kind: 'stringArray', note: '称呼过长的兜底候选池（t130 建 / **t131 以门禁本体逐条复核 12/12 PASS**，桃 `小甜甜·糖糖·小糖球·阿糖`）；设计 §2.7「必须给 2~3 个候选」；读者=t129 端点侧（**派生优先、本池补足**，每条候选标 `source: derived|pool`，且**取用时再验一次**）' },
 ];
 {
   const rows = [];
   for (const role of ['peach', 'tuanzi', 'heika']) {
     const obj = loaded[`${role}_corpus.json`];
     if (!obj) continue;
-    for (const { path: p, kind, note } of KEY_PATHS_PENDING_READER) {
-      const cur = p.split('.').reduce((a, k) => (a && typeof a === 'object' ? a[k] : undefined), obj);
+    for (const entry of KEY_PATHS_PENDING_READER) {
+      const { path: p, kind, note } = entry;
+      // t125：**显式别名**——命中别名时，按别名目标做**同一套**存在/类型/非空断言，
+      //   且把 `⇐alias:<目标>` 打进 shape/失败信息（**不得静默缺失**）。
+      //   无 `alias` 的条目行为与 t72 完全一致（既有 4 键语义未变）。
+      const aliasTarget = (entry.alias && entry.alias[role]) || '';
+      const target = aliasTarget || p;
+      const cur = target.split('.').reduce((a, k) => (a && typeof a === 'object' ? a[k] : undefined), obj);
       let ok = false, shape = '';
       if (cur === undefined) shape = 'undefined';
       else if (kind === 'stringArray') { ok = Array.isArray(cur) && cur.filter((x) => typeof x === 'string' && x.trim()).length > 0; shape = `array(${Array.isArray(cur) ? cur.length : 'n/a'})`; }
@@ -719,11 +748,14 @@ const KEY_PATHS_PENDING_READER = [
         ok = tiers.length > 0 && good.length === tiers.length;
         shape = `{${tiers.map(([k, v]) => `${k}:${Array.isArray(v) ? v.length : 'n/a'}`).join(', ')}}`;
       }
-      rows.push({ role, path: p, ok, shape });
-      if (!ok) hardFail('PENDING-READER', `${role} 的内容预留键 ${p} 缺失/空池（${shape}）——内容已声明落地却不存在`, { role, path: p, shape, note });
+      if (aliasTarget) shape = `${shape} ⇐alias:${aliasTarget}`;
+      rows.push({ role, path: p, ok, shape, alias: aliasTarget || null });
+      if (!ok) hardFail('PENDING-READER', `${role} 的内容预留键 ${p} 缺失/空池（${shape}）——内容已声明落地却不存在`, { role, path: p, shape, note, alias: aliasTarget || null });
     }
   }
+  const aliasRows = rows.filter((r) => r.alias);
   notes.push(`内容预留键（**未进 KEY_PATHS**，因读者未落地）：${KEY_PATHS_PENDING_READER.map((k) => k.path).join('、')} —— 存在/类型/非空断言 ${rows.filter((r) => r.ok).length}/${rows.length}；实现落地后应移入 KEY_PATHS`);
+  if (aliasRows.length) notes.push(`内容预留键**显式别名**（同语义、不复制条目）：${aliasRows.map((r) => `${r.role}:${r.path} ⇐ ${r.alias}`).join('；')} —— 别名为**同一套断言**，别名目标空池同样 hard fail`);
 }
 
 // ── 4. GATE DUP：同角色 / 跨角色逐字重复 ──

@@ -11,6 +11,10 @@ import fs from 'node:fs';
 import { estimateProviderCost, loadProviderPricing } from './provider_costs.mjs';
 // v1.20 (PR2): 隐私过滤挂在各长期存储写入函数入口（最窄腰部，所有调用方自动覆盖）
 import { filterForStorage, redactSensitiveInfo, replaceUserWording } from './privacy_filter.mjs';
+// t119 · C-3：称呼落库门禁 G-N1（**校验必须先于 upsertShaping**）。
+// 为什么必须在这里 import：称呼会被 companionUserAlias 当作"用户"的改写别名写进
+// **全库记忆文本** ⇒ 未校验的称呼落库 = 一次采集污染全库（设计 §2.6）。
+import { validateNicknameCandidate } from './nickname_gate.mjs';
 
 const DB_PATH = process.env.DB_PATH || path.resolve(process.cwd(), 'data/bot.db');
 // 确保 data 目录存在
@@ -62,6 +66,7 @@ export function getDb() {
     migrateBackfillFlag();
     migratePreferences();  // v1.8.0 #3
     migrateCompanionShaping();  // 共建留痕（教她说话/称呼/雷区/约定/专属梗）
+    migrateCompanionAccountEvents(); // t119 · C-4 账号级事件账本（纯加法新表）
     migrateOpenLoops();    // v1.8.0 #4
     migrateSafetyEvents(); // v1.9.0 #1 安全事件记录（高危后暂停普通主动消息）
     migrateRelationshipArc(); // v1.21.0 冲突与和好弧（关系事件状态机）
@@ -3422,11 +3427,187 @@ function migrateCompanionShaping() {
   `);
 }
 
+/**
+ * t119 · C-4：`companion_account_events` —— **账号级**事件账本（append-only）。
+ *
+ * ## 为什么新开表而不是给既有表加列（设计 §6.3 / §5.2 三条理由）
+ *   1. **避免语义分裂**：账号级的一次性事件（如 `nickname_event`）语义上不属于任何
+ *      单个 companion 行；塞进 companions 会让"账号级/角色级"在**同一行里**混着表达。
+ *   2. **既有行无法回填** ⇒ 加列必然得到"列存在但历史不可信"的状态，比不加更坏。
+ *   3. **加法可回滚**：新表对既有库与既有行**零破坏**，回滚只需停用写入端。
+ *
+ * ## 纯加法自证
+ *   - 只 `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`，
+ *     **不 ALTER 任何既有表、不给既有表加列**；
+ *   - 幂等键 `event_key` 作为 `UNIQUE` 列（**不是**多列 UNIQUE + 可空列）：
+ *     SQLite 的 UNIQUE 对 NULL 互不相等 ⇒ 若用 `(user_id, event_name, character_id)`
+ *     且 character_id 可空，账号级事件（character_id=NULL）会**每次都能插进去**，
+ *     幂等直接失效。故显式生成 `event_key`（账号级用 `acct` 占位）。
+ *   - 因此**无需**同步 `persona_export.mjs` 的 `PERSONA_FIELDS` 白名单
+ *     （那是 `companions` 的列白名单，本改动不新增任何列）。
+ */
+function migrateCompanionAccountEvents() {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS companion_account_events (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_key    TEXT    NOT NULL UNIQUE,
+      user_id      INTEGER NOT NULL,
+      event_name   TEXT    NOT NULL,
+      character_id INTEGER,
+      payload      TEXT,
+      created_at   TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_acct_events_user ON companion_account_events(user_id, event_name);
+  `);
+  // 纯加法：**不** ALTER 既有表；`ADD COLUMN` 一个都不加（若将来要加列，必须同步
+  // db.mjs 与 persona_export.mjs 的列白名单——两处必须同改，本表当前不需要）。
+}
+
 const SHAPING_KINDS = ['nickname','style','taboo','pact','fact','lexicon'];
 const SHAPING_SINGLETON = ['nickname', 'style'];   // 单例 kind：只保留最新一条
+
+/**
+ * t119 · G-N1 的"已过门禁"凭证（进程内、同步、用完即删）。
+ *
+ * 机制：`setCompanionNickname` 先过 `validateNicknameCandidate`，再放进本 Set 调
+ * `upsertShaping`，后者见到凭证才放行 `kind='nickname'`。
+ * 这样**没有任何路径能把未校验的称呼写进去**——即便将来有人从别处直接调
+ * `upsertShaping({kind:'nickname'})`，也会在写库前抛错（而不是污染 alias 链条）。
+ *
+ * 为什么不改 `upsertShaping` 的签名：它有既有调用方（bot.mjs 的"教她说话"路径、
+ * memory.mjs 的 lexicon 路径），改签名/加参数会波及它们；用模块内凭证是零波及的加法。
+ */
+const nicknameGateBypass = new Set();
+
+/**
+ * t119 · C-3：**称呼落库的唯一入口**（唯一写 `companion_shaping(kind='nickname')` 的口）。
+ *
+ * G-N1 顺序保证：**校验 → 凭证 → 写库**，校验一定先于 `upsertShaping`。
+ * 只接受规则抽取产出的 accepted 候选（带 `via: NICKNAME_EXTRACT_VIA` 凭证），
+ * 裸字符串一律 `not_rule_extracted` 拒绝。
+ *
+ * @param {{companionId:number, candidate:{text:string, via:string}, rawMsg?:string|null}} args
+ * @returns {{ok:boolean, code?:string, detail?:string, text?:string}} 不抛异常，便于调用方按码分支
+ */
+export function setCompanionNickname({ companionId, candidate, rawMsg = null }) {
+  if (!companionId) return { ok: false, code: 'missing_companion', detail: 'companionId is required' };
+  const verdict = validateNicknameCandidate(candidate);
+  if (!verdict.ok) return verdict;                       // ← 校验先于任何写操作
+  const text = verdict.text;
+  nicknameGateBypass.add(companionId);
+  try {
+    upsertShaping({ companionId, kind: 'nickname', content: text, rawMsg });
+  } finally {
+    nicknameGateBypass.delete(companionId);              // 无论成败都不留凭证
+  }
+  const after = getDb().prepare(
+    `SELECT content FROM companion_shaping WHERE companion_id = ? AND kind = 'nickname'
+     ORDER BY created_at DESC, id DESC LIMIT 1`
+  ).get(companionId);
+  if (!after || String(after.content) !== text) {
+    return { ok: false, code: 'write_not_landed', detail: '称呼写入后回读不一致（拒绝静默丢行）' };
+  }
+  return { ok: true, text };
+}
+
+/**
+ * t119 · 称呼读接口（加法）：把「按账号只问一次」所需状态一次读出。
+ *
+ * **单一状态源**：只读既有的 `companion_shaping(kind='nickname')` 与 `companions` 镜像列，
+ * 不新建任何并行状态源；`account_events` 只作"事件流水"（幂等/审计），
+ * 不参与"当前称呼是什么"的判定。
+ *
+ * @param {number} companionId
+ * @param {{userId?:number|null}} [opts]
+ */
+export function getCompanionNicknameState(companionId, { userId = null } = {}) {
+  const db = getDb();
+  const row = db.prepare(
+    `SELECT content, created_at FROM companion_shaping
+     WHERE companion_id = ? AND kind = 'nickname'
+     ORDER BY created_at DESC, id DESC LIMIT 1`
+  ).get(companionId);
+  let mirrored = null;
+  try {
+    const c = db.prepare(`SELECT player_nickname, nickname_level FROM companions WHERE id = ?`).get(companionId);
+    if (c) mirrored = { player_nickname: c.player_nickname ?? null, nickname_level: c.nickname_level ?? null };
+  } catch { /* 镜像列不可读时保持 null，不假设有值 */ }
+
+  const out = {
+    companionId,
+    nickname: row ? String(row.content) : null,
+    updated_at: row?.created_at ?? null,
+    source: row ? 'companion_shaping' : (mirrored?.player_nickname ? 'companions_mirror' : null),
+    mirrored,
+    asked: false,
+    asked_event: null,
+    decline_source: null,
+  };
+  if (userId) {
+    const asked = db.prepare(
+      `SELECT event_key, created_at FROM companion_account_events
+       WHERE user_id = ? AND event_name = 'nickname_event' ORDER BY id DESC LIMIT 1`
+    ).get(Number(userId));
+    out.asked = !!asked;
+    out.asked_event = asked ? { event_key: asked.event_key, created_at: asked.created_at } : null;
+    const declined = db.prepare(
+      `SELECT payload FROM companion_account_events
+       WHERE user_id = ? AND event_name = 'nickname_event' AND payload LIKE '%declined%'
+       ORDER BY id DESC LIMIT 1`
+    ).get(Number(userId));
+    out.decline_source = declined ? 'declined_default' : null;
+  }
+  return out;
+}
+
+/**
+ * t119 · C-4：账号级事件账本（**纯加法**新表）的写入口。
+ *
+ * `INSERT OR IGNORE` **断 rowcount**：SQLite 会静默忽略唯一键/NOT NULL 违例，
+ * 不看 rowcount 就会把"没写进去"当成"写成功了"（t93 那条教训的同族）。
+ *
+ * @param {{userId:number, eventName:string, characterId?:number|null, payload?:object|null}} args
+ * @returns {{written:boolean, eventKey:string}}
+ */
+export function recordCompanionAccountEvent({ userId, eventName, characterId = null, payload = null }) {
+  if (!userId || !eventName) throw new Error('recordCompanionAccountEvent: missing fields');
+  const eventKey = `${Number(userId)}:${String(eventName)}:${characterId == null ? 'acct' : Number(characterId)}`;
+  const info = getDb().prepare(
+    `INSERT OR IGNORE INTO companion_account_events (event_key, user_id, event_name, character_id, payload)
+     VALUES (?, ?, ?, ?, ?)`
+  ).run(eventKey, Number(userId), String(eventName), characterId == null ? null : Number(characterId),
+        payload ? JSON.stringify(payload) : null);
+  const written = (info?.changes ?? 0) === 1;
+  if (!written) {
+    // 区分"重复（幂等命中）"与"静默丢行"：回读一次，存在即为幂等命中。
+    const exists = getDb().prepare(`SELECT 1 AS one FROM companion_account_events WHERE event_key = ?`).get(eventKey);
+    if (!exists) {
+      throw new Error(`recordCompanionAccountEvent: INSERT OR IGNORE 未落行且不存在（${eventKey}）—— 拒绝静默丢行`);
+    }
+  }
+  return { written, eventKey };
+}
+
+/** t119 · C-4：读账号级事件（加法只读接口）。 */
+export function listCompanionAccountEvents(userId, { eventName = null, limit = 50 } = {}) {
+  const db = getDb();
+  const sql = eventName
+    ? `SELECT * FROM companion_account_events WHERE user_id = ? AND event_name = ? ORDER BY id DESC LIMIT ?`
+    : `SELECT * FROM companion_account_events WHERE user_id = ? ORDER BY id DESC LIMIT ?`;
+  return eventName
+    ? db.prepare(sql).all(Number(userId), String(eventName), Number(limit))
+    : db.prepare(sql).all(Number(userId), Number(limit));
+}
 export function upsertShaping({ companionId, kind, content, rawMsg = null }) {
   if (!companionId || !kind || !content) throw new Error('upsertShaping: missing fields');
   if (!SHAPING_KINDS.includes(kind)) throw new Error('upsertShaping: invalid kind');
+  // t119 · C-3 / G-N1（🔴 blocker）：**称呼是唯一会被当作用户改写别名扩散到全库记忆文本的
+  // kind**（companionUserAlias → replaceUserWording）。所以它必须**唯一**经由门禁入口
+  // `setCompanionNickname()` 落库；从别处直接传 kind='nickname' 一律拒绝，
+  // 避免"先落库、后校验"这种顺序错误把未校验称呼写进 alias 链条。
+  if (kind === 'nickname' && !nicknameGateBypass.has(companionId)) {
+    throw new Error('upsertShaping: nickname must go through setCompanionNickname (G-N1 gate)');
+  }
   // v1.20 隐私过滤（教她/专属梗也是长期存储）
   const pf = filterForStorage(content);
   if (!pf.store) { console.warn(`[PrivacyFilter] upsertShaping 拦截 companion=${companionId}`); return; }
@@ -3437,8 +3618,26 @@ export function upsertShaping({ companionId, kind, content, rawMsg = null }) {
   if (SHAPING_SINGLETON.includes(kind)) {
     db.prepare(`DELETE FROM companion_shaping WHERE companion_id = ? AND kind = ?`).run(companionId, kind);
   }
-  db.prepare(`INSERT OR IGNORE INTO companion_shaping (companion_id, kind, content, raw_msg) VALUES (?, ?, ?, ?)`)
+  const info = db.prepare(`INSERT OR IGNORE INTO companion_shaping (companion_id, kind, content, raw_msg) VALUES (?, ?, ?, ?)`)
     .run(companionId, kind, c, rawMsg ? String(rawMsg).slice(0, 200) : null);
+  // t119 · 写入安全：`INSERT OR IGNORE` **必须断 rowcount**。
+  // 为什么单例尤其危险：上面刚 DELETE 过，若这里的 INSERT 被 IGNORE 掉，
+  // 结果不是"没变化"而是"**旧称呼被删且新称呼没写进去**"（静默丢行）。
+  // 复用 `setCompanionNickname` 传进来的凭证时，还要把归属校验上：DELETE 只删
+  // 本次 companionId 的行，若 INSERT 竟换成了别人，"删对了人、写错了人"就更糟。
+  const changes = info?.changes ?? 0;
+  if (SHAPING_SINGLETON.includes(kind)) {
+    const stored = db.prepare(
+      `SELECT companion_id FROM companion_shaping WHERE companion_id = ? AND kind = ? AND content = ? LIMIT 1`
+    ).get(companionId, kind, c);
+    if (changes !== 1 || !stored || Number(stored.companion_id) !== Number(companionId)) {
+      throw new Error(
+        `upsertShaping: INSERT OR IGNORE 未落行（kind=${kind} changes=${changes}）—— ` +
+        '拒绝静默丢行（SQLite 会静默忽略 NOT NULL/唯一键违例）'
+      );
+    }
+  }
+  return changes;
 }
 
 export function listShaping(companionId, { kind = null } = {}) {
